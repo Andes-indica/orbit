@@ -15,6 +15,12 @@ describe('password authentication', () => {
     );
   });
 
+  it('exposes the MCP OAuth provider for one-click clients', () => {
+    expect(auth.options.plugins?.map((plugin) => plugin.id)).toEqual(
+      expect.arrayContaining(['mcp']),
+    );
+  });
+
   it('lets an authenticated user link a provider whose email differs', () => {
     expect(auth.options.account?.accountLinking?.enabled).toBe(true);
     expect(auth.options.account?.accountLinking?.allowDifferentEmails).toBe(true);

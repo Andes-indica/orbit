@@ -14,10 +14,23 @@ import { betterAuth } from 'better-auth';
 import { drizzleAdapter } from 'better-auth/adapters/drizzle';
 import { APIError, createAuthMiddleware, getSessionFromCtx } from 'better-auth/api';
 import { nextCookies } from 'better-auth/next-js';
-import { magicLink, organization } from 'better-auth/plugins';
+import { magicLink, mcp, organization } from 'better-auth/plugins';
 import { z } from 'zod';
 import { isDevLoginRequest } from '@/lib/api/dev-login.ts';
-import { serverEnv } from '@/lib/env.ts';
+import { mcpServerUrl, serverEnv } from '@/lib/env.ts';
+
+export const MCP_SCOPES = [
+  'openid',
+  'profile',
+  'email',
+  'offline_access',
+  'orbit.read',
+  'orbit.write',
+] as const;
+
+export const MCP_CONSENT_PATH = '/oauth/authorize';
+export const MCP_LOGIN_PATH = '/login';
+export const MCP_AUTHORIZE_START_PATH = '/api/oauth/start';
 
 const passkeyAssertionSchema = z.object({ response: z.object({ id: z.string().min(1) }) });
 
@@ -212,6 +225,16 @@ export const auth = betterAuth({
           template: 'invite',
           idempotencyKey: `org-invite:${data.id}`,
         });
+      },
+    }),
+    mcp({
+      loginPage: MCP_LOGIN_PATH,
+      resource: mcpServerUrl(),
+      oidcConfig: {
+        loginPage: MCP_LOGIN_PATH,
+        consentPage: MCP_CONSENT_PATH,
+        allowDynamicClientRegistration: true,
+        scopes: [...MCP_SCOPES],
       },
     }),
     nextCookies(),
