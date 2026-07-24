@@ -20,6 +20,7 @@ import { cn } from '@/lib/cn.ts';
 import type { Member } from '@/lib/query/schemas.ts';
 import { docProseClassName } from '../doc-body.tsx';
 import { findTrigger, matchSlashCommands, type SlashCommand } from './commands.ts';
+import { EditorToolbar } from './editor-toolbar.tsx';
 import {
   editorExtensions,
   type MenuKey,
@@ -43,6 +44,8 @@ export interface RichTextEditorProps {
   readonly testId?: string;
   readonly className?: string;
   readonly autoFocus?: boolean;
+  readonly toolbar?: 'full' | 'compact';
+  readonly editable?: boolean;
   readonly ariaLabel: string;
   readonly onSubmit?: () => void;
   readonly onForceSave?: () => void;
@@ -86,6 +89,8 @@ export function RichTextEditor({
   testId = 'rich-editor',
   className,
   autoFocus = false,
+  toolbar,
+  editable = true,
   ariaLabel,
   onSubmit,
   onForceSave,
@@ -133,6 +138,7 @@ export function RichTextEditor({
     extensions: editorExtensions(menuKeyRef, placeholder),
     content: toEditorHtml(renderMarkdown(value)),
     immediatelyRender: false,
+    editable,
     autofocus: autoFocus,
     editorProps: {
       attributes: {
@@ -156,6 +162,10 @@ export function RichTextEditor({
     emitted.current.add(value);
     editor.commands.setContent(toEditorHtml(renderMarkdown(value)), { emitUpdate: false });
   }, [editor, value]);
+
+  useEffect(() => {
+    if (editor !== null) editor.setEditable(editable);
+  }, [editor, editable]);
 
   const ready = useRef(onReady);
   ready.current = onReady;
@@ -349,7 +359,12 @@ export function RichTextEditor({
       ref={containerRef}
       aria-label={ariaLabel}
       data-testid={testId}
-      className={cn('relative min-h-0', className)}
+      className={cn(
+        'relative min-h-0',
+        toolbar === 'full' && 'flex flex-1 flex-col',
+        !editable && 'opacity-60',
+        className,
+      )}
       onKeyDown={onKeyDown}
       onPaste={onPaste}
       onDrop={onDrop}
@@ -357,7 +372,18 @@ export function RichTextEditor({
         if (onUpload !== undefined) event.preventDefault();
       }}
     >
-      <EditorContent editor={editor} className={cn(docProseClassName, editorSurfaceClassName)} />
+      {toolbar !== undefined && editable && editor !== null ? (
+        <EditorToolbar
+          editor={editor}
+          compact={toolbar === 'compact'}
+          className={toolbar === 'compact' ? 'mb-2 border-border border-b pb-2' : ''}
+          onPickFile={() => fileRef.current?.click()}
+          testId={`${testId}-toolbar`}
+        />
+      ) : null}
+      <div className={toolbar === 'full' ? 'min-h-0 flex-1 overflow-y-auto px-6 py-5' : 'contents'}>
+        <EditorContent editor={editor} className={cn(docProseClassName, editorSurfaceClassName)} />
+      </div>
 
       {onUpload === undefined ? null : (
         <input
