@@ -19,18 +19,41 @@ if (!poolMax.success) {
   );
 }
 
-const globalForDb = globalThis as unknown as { orbitPool?: SQL };
+const TRANSACTION_POOLER_PORT = 6543;
+
+export function multiplexesConnections(url: string): boolean {
+  try {
+    return Number(new URL(url).port) === TRANSACTION_POOLER_PORT;
+  } catch {
+    return false;
+  }
+}
+
+export function poolCacheKey(url: string, max: number, prepare: boolean): string {
+  return JSON.stringify([url, max, prepare]);
+}
+
+interface CachedPool {
+  readonly key: string;
+  readonly sql: SQL;
+}
+
+const globalForDb = globalThis as unknown as { orbitPool?: CachedPool };
+
+const prepareStatements = !multiplexesConnections(connectionString);
+const cacheKey = poolCacheKey(connectionString, poolMax.data, prepareStatements);
+const cached = globalForDb.orbitPool;
 
 export const pool =
-  globalForDb.orbitPool ??
-  new SQL(connectionString, {
-    max: poolMax.data,
-    idleTimeout: 30,
-  });
+  cached?.key === cacheKey
+    ? cached.sql
+    : new SQL(connectionString, {
+        max: poolMax.data,
+        idleTimeout: 30,
+        prepare: prepareStatements,
+      });
 
-if (process.env['NODE_ENV'] !== 'production') {
-  globalForDb.orbitPool = pool;
-}
+globalForDb.orbitPool = { key: cacheKey, sql: pool };
 
 export const db = drizzle({ client: pool, schema, casing: 'snake_case' });
 
