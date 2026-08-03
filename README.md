@@ -7,10 +7,10 @@ A free, realtime, keyboard-first work tracker. Issues, cycles, projects, and doc
 
 No pricing, no billing, no paid tiers.
 
-Orbit runs on [Bun](https://bun.sh) end to end: Bun installs the workspace, runs
-every script, executes the TypeScript, serves the WebSockets, talks to Postgres,
-Redis and S3 through Bun built-ins, runs the tests, and is the runtime inside
-every container image.
+[Bun](https://bun.sh) is the toolchain: it installs the workspace, runs every
+script, executes the TypeScript and runs the tests. Orbit ships as a single
+Next.js app on Vercel's node runtime, which is the runtime that can upgrade the
+websocket at `/api/ws`.
 
 ```bash
 bun install
@@ -24,8 +24,7 @@ bun run dev
 | Service | Port |
 | --- | --- |
 | web | 3000 |
-| realtime | 3100 |
-| mcp | 3200 |
+| realtime (development only) | 3100 |
 | postgres | 5434 |
 | redis | 6380 |
 | minio | 9010 |

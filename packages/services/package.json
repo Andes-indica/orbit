@@ -16,11 +16,14 @@
     "test": "bun --env-file=../../.env test"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1101.0",
+    "@aws-sdk/s3-request-presigner": "^3.1101.0",
     "@orbit/db": "workspace:*",
     "@orbit/shared": "workspace:*",
     "@react-email/components": "1.0.12",
     "@react-email/render": "2.1.0",
     "drizzle-orm": "0.45.2",
+    "linkedom": "^0.18.13",
     "marked": "18.0.7",
     "resend": "6.18.0",
     "zod": "4.4.3"

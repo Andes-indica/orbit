@@ -1,3 +1,5 @@
+import { parseHTML } from 'linkedom';
+
 const ALLOWED_TAGS = new Set([
   'p',
   'br',
@@ -203,46 +205,76 @@ function bunSanitizer(): HTMLRewriter {
   return rewriter;
 }
 
+interface Markup {
+  readonly nodes: ChildNode[];
+  html(): string;
+}
+
+function markupHolder(html: string): Markup {
+  if (typeof globalThis.document !== 'undefined') {
+    const template = globalThis.document.createElement('template');
+    template.innerHTML = html;
+    return {
+      nodes: Array.from(template.content.childNodes),
+      html: () => template.innerHTML,
+    };
+  }
+  const body = parseHTML(`<!doctype html><html><body>${html}</body></html>`).document
+    .body as unknown as Element;
+  return {
+    nodes: Array.from(body.childNodes) as ChildNode[],
+    html: () => body.innerHTML,
+  };
+}
+
+const COMMENT_NODE = 8;
+const ELEMENT_NODE = 1;
+const TEXT_NODE = 3;
+
+function asElement(node: ChildNode): Element | null {
+  return node.nodeType === ELEMENT_NODE ? (node as unknown as Element) : null;
+}
+
 function cleanDomNode(node: ChildNode): void {
-  if (node instanceof Comment) {
+  if (node.nodeType === COMMENT_NODE) {
     node.remove();
     return;
   }
-  if (!(node instanceof Element)) return;
+  const element = asElement(node);
+  if (element === null) return;
 
-  const tag = node.tagName.toLowerCase();
+  const tag = element.tagName.toLowerCase();
   if (DROP_WITH_CONTENT.has(tag)) {
-    node.remove();
+    element.remove();
     return;
   }
 
-  const children = Array.from(node.childNodes);
+  const children = Array.from(element.childNodes);
   if (ALLOWED_TAGS.has(tag)) {
-    const present = Array.from(node.attributes).map((attribute): [string, string] => [
+    const present = Array.from(element.attributes).map((attribute): [string, string] => [
       attribute.name,
       attribute.value,
     ]);
-    for (const [name] of present) node.removeAttribute(name);
+    for (const [name] of present) element.removeAttribute(name);
 
     const keep = keptAttributes(present);
-    for (const [key, value] of keep) node.setAttribute(key, value);
+    for (const [key, value] of keep) element.setAttribute(key, value);
 
     if (tag === 'a' && externalLinkTarget(keep)) {
-      node.setAttribute('target', '_blank');
-      node.setAttribute('rel', 'noopener noreferrer');
+      element.setAttribute('target', '_blank');
+      element.setAttribute('rel', 'noopener noreferrer');
     }
   } else {
-    node.replaceWith(...children);
+    element.replaceWith(...children);
   }
 
   for (const child of children) cleanDomNode(child);
 }
 
 function sanitizeInDom(html: string): string {
-  const template = document.createElement('template');
-  template.innerHTML = html;
-  for (const node of Array.from(template.content.childNodes)) cleanDomNode(node);
-  return template.innerHTML;
+  const holder = markupHolder(html);
+  for (const node of holder.nodes) cleanDomNode(node);
+  return holder.html();
 }
 
 export function sanitizeHtml(html: string): string {
@@ -253,23 +285,22 @@ export function sanitizeHtml(html: string): string {
 
 const VOID_TEXT_TAGS = new Set(['br', 'hr', 'img', 'input']);
 
-function collectDomText(node: Node, parts: string[]): void {
-  for (const child of Array.from(node.childNodes)) {
-    if (child instanceof Text) {
-      parts.push(child.data);
+function collectDomText(nodes: readonly ChildNode[], parts: string[]): void {
+  for (const child of nodes) {
+    if (child.nodeType === TEXT_NODE) {
+      parts.push(child.textContent ?? '');
       continue;
     }
-    if (!(child instanceof Element)) continue;
-    if (VOID_TEXT_TAGS.has(child.tagName.toLowerCase())) parts.push(' ');
-    collectDomText(child, parts);
+    const element = asElement(child);
+    if (element === null) continue;
+    if (VOID_TEXT_TAGS.has(element.tagName.toLowerCase())) parts.push(' ');
+    collectDomText(Array.from(element.childNodes), parts);
   }
 }
 
 function textInDom(html: string): string {
-  const template = document.createElement('template');
-  template.innerHTML = html;
   const parts: string[] = [];
-  collectDomText(template.content, parts);
+  collectDomText(markupHolder(html).nodes, parts);
   return parts.join('');
 }
 

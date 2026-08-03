@@ -12,6 +12,8 @@ const workspacePackages = [
   '@orbit/core',
   '@orbit/services',
   '@orbit/realtime-client',
+  '@orbit/realtime-server',
+  '@orbit/mcp-server',
 ];
 
 const devServerOnlyBundledPackages = ['@react-email/render', '@react-email/components', 'prettier'];

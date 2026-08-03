@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --env-file=../../.env --bun next dev --port ${PORT:-3000}",
-    "build": "bun --env-file=../../.env --bun next build",
+    "dev": "bun --env-file=../../.env next dev --port ${PORT:-3000}",
+    "build": "bun --env-file=../../.env next build",
     "start": "bun server.js",
     "typecheck": "tsc --noEmit",
     "test": "bun --env-file=../../.env test src",
@@ -23,9 +23,12 @@
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
     "@lezer/highlight": "^1.2.3",
+    "@node-rs/argon2": "^2.0.2",
     "@orbit/core": "workspace:*",
     "@orbit/db": "workspace:*",
+    "@orbit/mcp-server": "workspace:*",
     "@orbit/realtime-client": "workspace:*",
+    "@orbit/realtime-server": "workspace:*",
     "@orbit/services": "workspace:*",
     "@orbit/shared": "workspace:*",
     "@radix-ui/react-avatar": "^1.1.10",
@@ -52,6 +55,7 @@
     "@tiptap/pm": "^3",
     "@tiptap/react": "^3",
     "@tiptap/starter-kit": "^3",
+    "@vercel/functions": "^3.7.6",
     "better-auth": "^1.6.24",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -65,6 +69,7 @@
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
     "tailwind-merge": "^3.3.1",
+    "ws": "^8.21.1",
     "zod": "4.4.3"
   },
   "devDependencies": {
@@ -79,6 +84,7 @@
     "@types/node": "^26.1.1",
     "@types/react": "^19.2.3",
     "@types/react-dom": "^19.2.3",
+    "@types/ws": "^8.18.1",
     "tailwindcss": "^4.3.3",
     "typescript": "5.9.3"
   }

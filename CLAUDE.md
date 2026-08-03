@@ -4,62 +4,60 @@ Free, realtime, keyboard-first work tracker. Linear-grade UX, Plane-grade breadt
 
 ## Hard rules
 
-1. **Bun is the runtime, the package manager, and the script runner.** There is no pnpm, no npm, no yarn, no Node runtime, no Turbo, and no `node_modules` produced by anything but `bun install`. Every command in this file starts with `bun`. Reach for a Bun built-in before adding a dependency.
+1. **Bun is the package manager and the script runner.** There is no pnpm, no npm, no yarn, no Turbo, and no `node_modules` produced by anything but `bun install`. Every command in this file starts with `bun`. The deployed runtime is node, so shipped code must not import a Bun built-in.
 2. **No comments in code.** Ever. `bun run check-comments` fails the build on any comment that is not a functional directive (`@ts-*`, `biome-ignore`, `eslint-*`, `/*! license */`). Make names and structure carry meaning.
 3. **No AI attribution.** Never mention Claude, Anthropic, Codex, or AI tooling in commits, branches, PRs, code, or docs.
 4. **No em-dash characters** in code, copy, docs, or commit messages. Use commas, colons, or separate sentences.
 5. **Strict types only.** `any` is a lint error. Non-null assertions are a lint error. `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes` are on. Validate every external input with Zod.
 6. **Every check green before you finish.** `bun run verify` runs lint, comment policy, typecheck, and tests.
 
-## Bun first
+## Bun is the toolchain, not the runtime
 
-Prefer the built-in over the package. These are the ones this repo already relies on, and new code must use them rather than reintroducing an SDK:
+Bun installs, runs scripts, and runs tests. Shipped server code must not call a
+Bun built-in, because the web app runs on Vercel's node runtime: that is the only
+runtime where a Vercel function can upgrade a websocket, and `/api/ws` needs it.
+Anything imported from `bun` fails there with `Cannot find module 'bun'`.
 
 | Need | Use | Never use |
 | --- | --- | --- |
-| Postgres | `Bun.SQL` through `drizzle-orm/bun-sql` | `pg`, `postgres.js` |
-| Redis and pub/sub | `Bun.RedisClient` (`subscribe`, `unsubscribe`, `publish`) | `ioredis`, `node-redis` |
-| WebSocket server | `Bun.serve({ websocket })` and its native topic pub/sub | `ws`, `socket.io` |
-| Object storage | `Bun.S3Client` (`write`, `file`, `presign`, `stat`, `delete`) | `@aws-sdk/client-s3`, `@aws-sdk/s3-request-presigner` |
-| Reading and writing files | `Bun.file()`, `Bun.write()` | `node:fs` |
+| Postgres | `postgres.js` through `drizzle-orm/postgres-js` | `Bun.SQL`, `drizzle-orm/bun-sql`, `pg` |
+| Redis and pub/sub | `ioredis` | `Bun.RedisClient`, `node-redis` |
+| Object storage | `@aws-sdk/client-s3` and `@aws-sdk/s3-request-presigner` | `Bun.S3Client` |
+| Reading and writing files | `node:fs/promises` | `Bun.file()`, `Bun.write()` |
+| Hashing passwords | `@node-rs/argon2` (argon2id) | `Bun.password`, `bcrypt` |
+| Sortable ids | `randomUUIDv7()` from `@orbit/shared/utils` | `Bun.randomUUIDv7()`, `ulid`, `nanoid` |
+| WebSocket server | `ws`, upgraded by `@vercel/functions` | `Bun.serve({ websocket })` in shipped code |
 | Running TypeScript | `bun file.ts` | `tsx`, `ts-node` |
-| Bundling a service | `bun build --target=bun` | `esbuild`, `rollup` |
 | Tests | `bun test` | `vitest`, `jest` |
 | Subprocesses | `Bun.spawn`, `Bun.$` | `node:child_process` |
-| Hashing passwords | `Bun.password` (argon2id) | `bcrypt`, `argon2` |
-| Sortable ids | `Bun.randomUUIDv7()` | `ulid`, `uuid`, `nanoid` |
-| Env files | `bun --env-file=...` | `dotenv` |
 | Workspace script running | `bun run --filter '<pattern>' <script>` | `turbo`, `nx`, `lerna` |
+| Env files | `bun --env-file=...` | `dotenv` |
+
+Test files and `apps/realtime` may use Bun built-ins, because both only ever run
+under Bun. `packages/realtime-server` is imported by the web app, so it may not.
 
 Bun does not implement `process.loadEnvFile`. Load the repository `.env` with `bun --env-file=../../.env` in the script, never from inside a config file.
-
-Bun's `S3Client` reads ambient `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
-`AWS_SESSION_TOKEN` and snapshots them when the process starts. Deleting them from
-`process.env` or `Bun.env` afterwards does nothing, and passing an empty or
-undefined `sessionToken` does not suppress them either. When explicit keys are also
-configured the ambient session token is still attached to the signature and every
-request fails with `InvalidTokenId`, which is exactly how a broken PDF upload
-presents. `S3StorageDriver` therefore presigns a probe URL at construction and
-refuses to start if a session token leaked in. If you hit that error locally,
-start the process with the variable unset:
-
-```
-env -u AWS_SESSION_TOKEN -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY bun run dev
-```
 
 Bun does not load a parent directory `.env`, so a script running with its cwd inside a workspace package needs `--env-file=../../.env` to see the repository environment.
 
 ## Layout
 
 ```
-apps/web         Next.js 16 app: UI, REST route handlers, auth, webhooks
-apps/realtime    Bun.serve WebSocket server, fans out deltas from Redis pub/sub
-apps/mcp         MCP server over streamable HTTP
-packages/db      Drizzle schema, migrations, client, seed
-packages/shared  Zod validators, domain types, event contracts, pure utils
-scripts/         repo tooling, written in TypeScript and run with bun
-extras/          working notes, task board, demo artifacts (not shipped)
+apps/web                  Next.js 16 app: UI, REST route handlers, auth, webhooks,
+                          the realtime socket at /api/ws and the MCP server at /mcp
+apps/realtime             Bun.serve WebSocket host, local development only, never deployed
+packages/realtime-server  Connection hub: tickets, scopes, presence, Redis fan-out
+packages/mcp-server       MCP tools and the fetch handler behind /mcp
+packages/db               Drizzle schema, migrations, client, seed
+packages/shared           Zod validators, domain types, event contracts, pure utils
+scripts/                  repo tooling, written in TypeScript and run with bun
+extras/                   working notes, task board, demo artifacts (not shipped)
 ```
+
+Everything ships as one Next.js app on a single Vercel project. The realtime hub
+and the MCP tools live in packages so the app stays thin and both keep their own
+test suites. `apps/realtime` exists only so local development has a socket server,
+because a Vercel function cannot upgrade a connection under `next dev`.
 
 Cross-app code lives in `packages/shared`. If two apps need it, it belongs there, never duplicated.
 
@@ -75,7 +73,10 @@ bun run verify       lint + comment policy + typecheck + tests
 bun test             run one package's tests from inside that package
 ```
 
-Ports: web 3000, realtime 3100, mcp 3200, postgres 5434, redis 6380, minio 9010.
+Ports: web 3000, realtime 3100, postgres 5434, redis 6380, minio 9010. The realtime
+port is development only. In production the socket is served from the web app at
+`/api/ws`, and the client falls back to the same origin whenever
+`NEXT_PUBLIC_REALTIME_URL` is unset.
 
 Email goes out through Resend only. Set `RESEND_API_KEY` and an `EMAIL_FROM` on a
 domain verified in Resend, otherwise every send fails.
@@ -89,7 +90,7 @@ domain verified in Resend, otherwise every send fails.
 - **Server state.** TanStack Query for fetching, with optimistic mutations. The realtime stream invalidates and patches the cache; it never triggers a full refetch of a list the user is looking at.
 - **Realtime.** Every mutation writes to Postgres, bumps `sync_id`, and publishes a `SyncAction` to Redis. The realtime server fans it out to subscribed clients. Contract lives in `packages/shared/src/events`.
 - **Auth.** better-auth. Passkeys, Google, GitHub, magic link. Email and password is
-  optional, off unless `ORBIT_PASSWORD_AUTH=true`, hashed with `Bun.password` (argon2id),
+  optional, off unless `ORBIT_PASSWORD_AUTH=true`, hashed with `@node-rs/argon2` (argon2id),
   rate limited, and never a replacement for the passwordless methods.
 - **MCP auth.** OAuth only, no API keys. The web app hosts the OAuth server through the better-auth
   `mcp` plugin: discovery under `/.well-known/oauth-*`, dynamic client registration, PKCE, and a
@@ -116,38 +117,23 @@ domain verified in Resend, otherwise every send fails.
 
 ## Deployment
 
-Every image is built `FROM oven/bun` and runs `bun` as its entrypoint. There is no
-`turbo prune`: each Dockerfile copies the root `package.json`, `bun.lock` and every
-workspace `package.json`, runs `bun install --frozen-lockfile`, then copies sources.
+Orbit is one Vercel project. The root directory is `apps/web`, the build runs
+`bun run build` there, and functions serve on the node runtime. Nothing is
+containerised and nothing runs in Kubernetes.
 
-`bun install --frozen-lockfile` exits 0 when there is no lockfile at all, so a
-`.dockerignore` mistake would silently produce a floating dependency tree instead
-of failing. Every Dockerfile asserts `test -s bun.lock` before installing. Keep
-that line.
+The node runtime is not optional. `/api/ws` upgrades through
+`experimental_upgradeWebSocket` from `@vercel/functions`, and Vercel only injects
+that upgrade bridge on node. Setting `bunVersion` in `apps/web/vercel.json` moves
+every function to the bun runtime, where the upgrade silently never happens and
+the client just retries against a socket that never opens.
 
-Bun's resident memory for the Next.js server runs roughly 60 to 80 percent above
-Node's, and Bun has no equivalent of `--max-old-space-size`, so there is no heap
-ceiling to set. The web pod is sized for that: 512Mi requested, 2Gi limit. Watch
-RSS after a deploy rather than assuming it plateaus.
+Upgrade before doing any other work in that route. Awaiting redis, the database
+or anything else first stops the handshake reaching a 101, so attach the hub
+after the socket is open and buffer whatever arrives in between.
 
-Rolling the web service back to Node means editing `apps/web/Dockerfile` (runner
-stage to `node:24-alpine`, `CMD` to `node`). Editing only the k8s manifest does
-nothing: in `oven/bun` images `node` is a symlink to `bun`, so
-`command: [..., "node", ...]` still runs Bun, silently.
-
-Deploy by hand with:
-
-```sh
-KUBE_API_SERVER=http://127.0.0.1:8080 ./extras/scripts/docker-build-push.sh -y
-```
-
-Name services to narrow it, for example `... docker-build-push.sh web mcp -y`.
-
-The CodeBuild pipeline (`buildspec.yml`) builds and pushes web, realtime and mcp
-and rolls them out. It never runs a schema migration. Migrations are applied
-locally against the target database (reach prod through `extras/prod-tunnel`),
-never by a job in the cluster, so any schema change must be pushed before the
-code that depends on it ships.
+Migrations are applied locally against the target database, never by a job in the
+platform, so any schema change must be pushed before the code that depends on it
+ships.
 
 ## Git
 
