@@ -10,6 +10,7 @@ import {
   stateNamed,
   type Workspace,
 } from '../test-support.ts';
+import { createCycle } from './cycle-service.ts';
 import {
   archiveIssue,
   bulkUpdateIssues,
@@ -17,6 +18,7 @@ import {
   deleteIssue,
   getIssue,
   getIssueCounts,
+  getIssueSummary,
   listIssues,
   listRelations,
   listSubscribers,
@@ -28,6 +30,7 @@ import {
   unsubscribe,
   updateIssue,
 } from './issue-service.ts';
+import { createProject } from './project-service.ts';
 
 let workspace: Workspace;
 
@@ -105,7 +108,7 @@ describe('createIssue', () => {
     expect(activity[0]?.field).toBe('created');
   });
 
-  it('returns a sync action scoped to org, team, and issue', async () => {
+  it('scopes a sync action to the team and the issue, never to the whole organization', async () => {
     const { issue, actions } = await createIssue(workspace.admin, {
       teamId: workspace.teamId,
       title: 'Scoped',
@@ -117,12 +120,9 @@ describe('createIssue', () => {
     expect(action?.action).toBe('insert');
     expect(action?.syncId).toBeGreaterThan(0);
     expect(action?.scopes).toEqual(
-      expect.arrayContaining([
-        scopes.organization(workspace.organizationId),
-        scopes.team(workspace.teamId),
-        scopes.issue(issue.id),
-      ]),
+      expect.arrayContaining([scopes.team(workspace.teamId), scopes.issue(issue.id)]),
     );
+    expect(action?.scopes).not.toContain(scopes.organization(workspace.organizationId));
     expect(action?.actor.id).toBe(workspace.admin.userId);
     expect(() => new Date(action?.at ?? '')).not.toThrow();
   });
@@ -299,6 +299,56 @@ describe('moveIssue', () => {
     expect(moved.actions[0]?.scopes).toContain(scopes.team(team.id));
   });
 
+  it('drops the sprint and project links that belong to the team it left', async () => {
+    const { cycle } = await createCycle(workspace.admin, {
+      teamId: workspace.teamId,
+      startsAt: new Date('2030-01-01').toISOString(),
+      endsAt: new Date('2030-01-15').toISOString(),
+    });
+    const { project } = await createProject(workspace.admin, {
+      name: 'Engineering only',
+      teamIds: [workspace.teamId],
+    });
+    const issue = await newIssue('Transferred', { cycleId: cycle.id, projectId: project.id });
+    expect(issue.cycleId).toBe(cycle.id);
+    expect(issue.projectId).toBe(project.id);
+
+    const { team, states } = await createTeam(workspace.admin, { name: 'Design', key: 'DSGN' });
+    const target = states.find((state) => state.category === 'unstarted');
+    if (target === undefined) throw new Error('missing target state');
+
+    const moved = await moveIssue(workspace.admin, issue.id, {
+      teamId: team.id,
+      stateId: target.id,
+      beforeId: null,
+      afterId: null,
+    });
+
+    expect(moved.issue.teamId).toBe(team.id);
+    expect(moved.issue.cycleId).toBeNull();
+    expect(moved.issue.projectId).toBeNull();
+    expect(moved.issue.milestoneId).toBeNull();
+  });
+
+  it('keeps a project that spans the destination team', async () => {
+    const { team, states } = await createTeam(workspace.admin, { name: 'Design', key: 'DSGN' });
+    const target = states.find((state) => state.category === 'unstarted');
+    if (target === undefined) throw new Error('missing target state');
+    const { project } = await createProject(workspace.admin, {
+      name: 'Cross team',
+      teamIds: [workspace.teamId, team.id],
+    });
+    const issue = await newIssue('Shared work', { projectId: project.id });
+
+    const moved = await moveIssue(workspace.admin, issue.id, {
+      teamId: team.id,
+      stateId: target.id,
+      beforeId: null,
+      afterId: null,
+    });
+    expect(moved.issue.projectId).toBe(project.id);
+  });
+
   it('applies state timestamps when moving across columns', async () => {
     const issue = await newIssue('Crossing');
     const moved = await moveIssue(workspace.admin, issue.id, {
@@ -337,10 +387,23 @@ describe('listIssues', () => {
     await newIssue('Heavy issue', { description: 'A body long enough to matter on the wire.' });
 
     const listed = await listIssues(workspace.admin, {});
-    expect(listed.issues[0]?.description).toBe('');
+    const row = listed.issues[0];
+    expect(row?.description).toBeUndefined();
 
     const full = await listIssues(workspace.admin, { select: 'full' });
     expect(full.issues[0]?.description).toBe('A body long enough to matter on the wire.');
+  });
+
+  it('omits the columns no list surface reads so the page stays small on the wire', async () => {
+    await newIssue('Wire weight');
+
+    const [row] = (await listIssues(workspace.admin, {})).issues;
+    expect(row).toBeDefined();
+    for (const column of ['organizationId', 'description', 'estimatePointId', 'stateEnteredAt']) {
+      expect(Object.hasOwn(row ?? {}, column)).toBe(false);
+    }
+    expect(row?.id).toBeDefined();
+    expect(row?.sortOrder).toBeDefined();
   });
 
   it('hides archived issues unless asked', async () => {
@@ -404,6 +467,81 @@ describe('listIssues', () => {
     const byState = new Map(counts.map((row) => [row.stateId, row.total]));
     expect(byState.get(stateNamed(workspace, 'Done').id)).toBe(1);
     expect(byState.get(stateNamed(workspace, 'Todo').id)).toBe(1);
+  });
+});
+
+describe('getIssueSummary', () => {
+  it('reports the filtered total beside the unfiltered scope, so nothing has to be crawled', async () => {
+    const mine = await newIssue('Mine');
+    await newIssue('Theirs');
+    await newIssue('Also theirs');
+    await updateIssue(workspace.admin, mine.id, { assigneeId: workspace.admin.userId });
+
+    const summary = await getIssueSummary(workspace.admin, {
+      teamId: workspace.teamId,
+      filter: {
+        kind: 'group',
+        combinator: 'and',
+        children: [
+          {
+            kind: 'condition',
+            property: 'assignee',
+            operator: 'in',
+            values: [workspace.admin.userId],
+            negate: false,
+          },
+        ],
+      },
+    });
+
+    expect(summary.total).toBe(1);
+    expect(summary.scopeTotal).toBe(3);
+  });
+
+  it('counts every facet value across the whole scope, not just a loaded page', async () => {
+    const done = await newIssue('Shipped');
+    await newIssue('Waiting');
+    await updateIssue(workspace.admin, done.id, {
+      stateId: stateNamed(workspace, 'Done').id,
+      assigneeId: workspace.admin.userId,
+    });
+
+    const summary = await getIssueSummary(workspace.admin, { teamId: workspace.teamId });
+
+    expect(summary.facets.state[stateNamed(workspace, 'Done').id]).toBe(1);
+    expect(summary.facets.state[stateNamed(workspace, 'Todo').id]).toBe(1);
+    expect(summary.facets.assignee[workspace.admin.userId]).toBe(1);
+    expect(summary.facets.assignee['none']).toBe(1);
+    expect(summary.facets.project['none']).toBe(2);
+    expect(summary.facets.label['none']).toBe(2);
+    expect(summary.facets.milestone['none']).toBe(2);
+  });
+
+  it('leaves the facet counts untouched when a filter narrows the result', async () => {
+    const done = await newIssue('Shipped');
+    await newIssue('Waiting');
+    await updateIssue(workspace.admin, done.id, { stateId: stateNamed(workspace, 'Done').id });
+
+    const summary = await getIssueSummary(workspace.admin, {
+      teamId: workspace.teamId,
+      filter: {
+        kind: 'group',
+        combinator: 'and',
+        children: [
+          {
+            kind: 'condition',
+            property: 'state',
+            operator: 'in',
+            values: [stateNamed(workspace, 'Done').id],
+            negate: false,
+          },
+        ],
+      },
+    });
+
+    expect(summary.total).toBe(1);
+    expect(summary.scopeTotal).toBe(2);
+    expect(summary.facets.state[stateNamed(workspace, 'Todo').id]).toBe(1);
   });
 });
 

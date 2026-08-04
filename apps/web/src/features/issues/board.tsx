@@ -20,18 +20,24 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type { DisplayProperty } from '@orbit/shared/filters';
-import { DEFAULT_DISPLAY_PROPERTIES } from '@orbit/shared/filters';
+import { DEFAULT_DISPLAY_PROPERTIES, emptyFilterGroup } from '@orbit/shared/filters';
 import { Plus } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { IssueGroup } from '@/features/filters/grouping.ts';
 import { cn } from '@/lib/cn.ts';
 import type { Cycle, Issue, Label, Member, Project, WorkflowState } from '@/lib/query/schemas.ts';
-import { type MoveInput, useMoveIssue } from '@/lib/query/use-issues.ts';
+import type { IssueQuery } from '@/lib/query/use-issues.ts';
+import { type MoveInput, useColumnIssues, useMoveIssue } from '@/lib/query/use-issues.ts';
 import { GroupGlyph } from './group-glyph.tsx';
 import { IssueCard } from './issue-card.tsx';
 import { IssuePeek } from './issue-peek.tsx';
 import { useWorkspace } from './workspace-provider.tsx';
+
+export interface BoardColumnSource {
+  readonly teamId: string;
+  readonly query: IssueQuery;
+}
 
 export interface BoardProps {
   readonly teamId: string;
@@ -41,7 +47,10 @@ export interface BoardProps {
   readonly hasMore?: boolean;
   readonly loadingMore?: boolean;
   readonly onLoadMore?: (() => void) | undefined;
+  readonly columnSource?: BoardColumnSource | undefined;
 }
+
+const EMPTY_QUERY: IssueQuery = { filter: emptyFilterGroup(), orderBy: 'manual' };
 
 const INITIAL_VISIBLE = 15;
 const VISIBLE_STEP = 15;
@@ -161,6 +170,7 @@ export function Board({
   hasMore = false,
   loadingMore = false,
   onLoadMore,
+  columnSource,
 }: BoardProps) {
   const { labelById, memberById, stateById, projects, cycles, openQuickCreate } = useWorkspace();
   const router = useRouter();
@@ -168,7 +178,23 @@ export function Board({
   const [activeId, setActiveId] = useState<string | null>(null);
   const [peekId, setPeekId] = useState<string | null>(null);
 
-  const issues = useMemo(() => groups.flatMap((group) => [...group.issues]), [groups]);
+  const [columnRows, setColumnRows] = useState<ReadonlyMap<string, readonly Issue[]>>(new Map());
+  const publishRows = useCallback((groupId: string, rows: readonly Issue[]) => {
+    setColumnRows((current) =>
+      current.get(groupId) === rows ? current : new Map(current).set(groupId, rows),
+    );
+  }, []);
+
+  const loadedGroups = useMemo(
+    () =>
+      groups.map((group) => {
+        const rows = columnRows.get(group.id);
+        return rows === undefined || rows === group.issues ? group : { ...group, issues: rows };
+      }),
+    [groups, columnRows],
+  );
+
+  const issues = useMemo(() => loadedGroups.flatMap((group) => [...group.issues]), [loadedGroups]);
   const projectById = useMemo(
     () => new Map(projects.map((project) => [project.id, project])),
     [projects],
@@ -202,7 +228,12 @@ export function Board({
   const onDragEnd = (event: DragEndEvent) => {
     setActiveId(null);
     if (event.over === null) return;
-    const placement = planDrop(groups, issues, String(event.active.id), String(event.over.id));
+    const placement = planDrop(
+      loadedGroups,
+      issues,
+      String(event.active.id),
+      String(event.over.id),
+    );
     if (placement !== null) move.mutate(placement);
   };
 
@@ -218,8 +249,10 @@ export function Board({
           hasMore={hasMore}
           loadingMore={loadingMore}
           onLoadMore={onLoadMore}
+          columnSource={columnSource}
           onCreate={() => openQuickCreate()}
           onOpen={setPeekId}
+          onRows={publishRows}
         />
       ))}
     </div>
@@ -273,8 +306,10 @@ interface BoardColumnProps {
   readonly hasMore: boolean;
   readonly loadingMore: boolean;
   readonly onLoadMore: (() => void) | undefined;
+  readonly columnSource: BoardColumnSource | undefined;
   readonly onCreate: () => void;
   readonly onOpen: (id: string) => void;
+  readonly onRows: (groupId: string, issues: readonly Issue[]) => void;
 }
 
 function BoardColumn({
@@ -285,23 +320,42 @@ function BoardColumn({
   hasMore,
   loadingMore,
   onLoadMore,
+  columnSource,
   onCreate,
   onOpen,
+  onRows,
 }: BoardColumnProps) {
+  const owned = useColumnIssues(
+    columnSource?.teamId ?? null,
+    columnSource?.query ?? EMPTY_QUERY,
+    group.id,
+    columnSource !== undefined,
+  );
+  const ownsData = columnSource !== undefined;
+  const issues = ownsData ? (owned.data ?? group.issues) : group.issues;
+
+  useEffect(() => {
+    onRows(group.id, issues);
+  }, [onRows, group.id, issues]);
+  const columnHasMore = ownsData ? owned.hasNextPage : hasMore;
+  const columnLoadingMore = ownsData ? owned.isFetchingNextPage : loadingMore;
+  const loadMore = ownsData
+    ? () => {
+        owned.fetchNextPage().catch(() => undefined);
+      }
+    : onLoadMore;
+
   const { setNodeRef } = useDroppable({ id: group.id, data: { isColumn: true } });
   const scrollRef = useRef<HTMLUListElement | null>(null);
   const sentinelRef = useRef<HTMLLIElement | null>(null);
   const scrolledRef = useRef(false);
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE);
 
-  const total = group.issues.length;
-  const hasHiddenLocal = visibleCount < total;
-  const visibleIssues = useMemo(
-    () => group.issues.slice(0, visibleCount),
-    [group.issues, visibleCount],
-  );
+  const loaded = issues.length;
+  const hasHiddenLocal = visibleCount < loaded;
+  const visibleIssues = useMemo(() => issues.slice(0, visibleCount), [issues, visibleCount]);
 
-  const canFetchMore = hasMore && onLoadMore !== undefined;
+  const canFetchMore = columnHasMore && loadMore !== undefined;
   const wantsSentinel = hasHiddenLocal || canFetchMore;
 
   useEffect(() => {
@@ -312,16 +366,16 @@ function BoardColumn({
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting)) return;
         if (hasHiddenLocal) {
-          setVisibleCount((count) => Math.min(count + VISIBLE_STEP, total));
+          setVisibleCount((count) => Math.min(count + VISIBLE_STEP, loaded));
         } else if (scrolledRef.current && canFetchMore) {
-          onLoadMore?.();
+          loadMore?.();
         }
       },
       { root, rootMargin: '240px' },
     );
     observer.observe(node);
     return () => observer.disconnect();
-  }, [wantsSentinel, hasHiddenLocal, canFetchMore, total, onLoadMore]);
+  }, [wantsSentinel, hasHiddenLocal, canFetchMore, loaded, loadMore]);
 
   const markScrolled = useCallback(() => {
     scrolledRef.current = true;
@@ -353,7 +407,7 @@ function BoardColumn({
 
   const footer = (
     <>
-      {loadingMore && !hasHiddenLocal ? (
+      {columnLoadingMore && !hasHiddenLocal ? (
         <li className="h-[4.75rem] shrink-0 animate-pulse list-none rounded-lg bg-surface-3/50" />
       ) : null}
       {wantsSentinel ? (
@@ -373,7 +427,7 @@ function BoardColumn({
         <GroupGlyph group={group} />
         <h2 className="font-medium text-dense text-text">{group.title}</h2>
         <span data-numeric className="text-2xs text-faint">
-          {group.issues.length}
+          {group.total}
         </span>
         <button
           type="button"

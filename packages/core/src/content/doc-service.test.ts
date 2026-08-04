@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { scopes } from '@orbit/shared/events';
+import { DOC_CONTENT_LIMIT } from '@orbit/shared/validators';
+import { createTeam } from '../org/team-service.ts';
 import { addMember, createWorkspace, resetDatabase, type Workspace } from '../test-support.ts';
 import {
   archiveDoc,
@@ -15,6 +17,7 @@ import {
   listPublicDocs,
   publishedDocToken,
   restoreDocVersion,
+  setDocAccess,
   shareDoc,
   updateDoc,
   updateDocCollection,
@@ -398,5 +401,202 @@ describe('backlinks', () => {
     const detail = await getDoc(workspace.admin, target.id);
     expect(detail.backlinks.map((entry) => entry.id)).toEqual([linking.id]);
     expect((await getDoc(workspace.admin, linking.id)).backlinks).toEqual([]);
+  });
+});
+
+describe('doc access', () => {
+  it('keeps a private doc away from everyone but its author', async () => {
+    const { principal: other } = await addMember(workspace, 'member');
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Compensation review',
+      content: 'Numbers nobody else should read.',
+      visibility: 'private',
+    });
+
+    await expect(getDoc(other, doc.id)).rejects.toMatchObject({ code: 'not_found' });
+    const listed = await listDocs(other, {});
+    expect(listed.some((row) => row.id === doc.id)).toBe(false);
+
+    const asAuthor = await getDoc(workspace.admin, doc.id);
+    expect(asAuthor.doc.id).toBe(doc.id);
+  });
+
+  it('shares a private doc with exactly the people it was shared with', async () => {
+    const { principal: invited, user: invitedUser } = await addMember(workspace, 'member');
+    const { principal: stranger } = await addMember(workspace, 'member');
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Shared plan',
+      content: 'For a named few.',
+      visibility: 'private',
+    });
+
+    await setDocAccess(workspace.admin, doc.id, [
+      { subjectType: 'user', subjectId: invitedUser.id, level: 'read' },
+    ]);
+
+    expect((await getDoc(invited, doc.id)).doc.id).toBe(doc.id);
+    expect((await listDocs(invited, {})).some((row) => row.id === doc.id)).toBe(true);
+    await expect(getDoc(stranger, doc.id)).rejects.toMatchObject({ code: 'not_found' });
+  });
+
+  it('shares with a whole team when the grant names one', async () => {
+    const team = await createTeam(workspace.admin, { name: 'Design', key: 'DSGN' });
+    const { principal: designer } = await addMember(workspace, 'member', {
+      teamIds: [team.team.id],
+    });
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Design brief',
+      content: 'For the design team.',
+      visibility: 'private',
+    });
+
+    await expect(getDoc(designer, doc.id)).rejects.toMatchObject({ code: 'not_found' });
+    await setDocAccess(workspace.admin, doc.id, [
+      { subjectType: 'team', subjectId: team.team.id, level: 'read' },
+    ]);
+    expect((await getDoc(designer, doc.id)).doc.id).toBe(doc.id);
+  });
+
+  it('leaves workspace docs readable by everyone, as before', async () => {
+    const { principal: guest } = await addMember(workspace, 'guest');
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Handbook',
+      content: 'Everybody reads this.',
+      visibility: 'workspace',
+    });
+    expect((await getDoc(guest, doc.id)).doc.id).toBe(doc.id);
+  });
+
+  it('lets an admin reach a private doc they do not own', async () => {
+    const { principal: author, user: authorUser } = await addMember(workspace, 'member');
+    const { doc } = await createDoc(author, {
+      title: 'Personal notes',
+      content: 'Mine.',
+      visibility: 'private',
+    });
+    expect(doc.authorId).toBe(authorUser.id);
+    expect((await getDoc(workspace.admin, doc.id)).doc.id).toBe(doc.id);
+  });
+});
+
+describe('a doc body never travels on the wire', () => {
+  it('announces a change without the content', async () => {
+    const secret = 'A body that should never appear in a delta payload.';
+    const { actions } = await createDoc(workspace.admin, {
+      title: 'Long doc',
+      content: secret,
+      visibility: 'workspace',
+    });
+
+    const payload = JSON.stringify(actions);
+    expect(actions.length).toBeGreaterThan(0);
+    expect(payload).not.toContain(secret);
+    expect(payload).toContain('Long doc');
+  });
+
+  it('accepts a document far larger than the old hundred kilobyte cap', async () => {
+    const long = 'x'.repeat(200_000);
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Very long',
+      content: long,
+      visibility: 'workspace',
+    });
+    const read = await getDoc(workspace.admin, doc.id);
+    expect(read.doc.content.length).toBe(200_000);
+  });
+
+  it('refuses a document past the doc limit with an explanation', async () => {
+    await expect(
+      createDoc(workspace.admin, {
+        title: 'Too long',
+        content: 'x'.repeat(DOC_CONTENT_LIMIT + 1),
+        visibility: 'workspace',
+      }),
+    ).rejects.toThrow();
+  });
+});
+
+describe('a read grant does not become a write grant', () => {
+  it('refuses an edit from somebody granted read only', async () => {
+    const { principal: reader, user: readerUser } = await addMember(workspace, 'member');
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Board pack',
+      content: 'Read this, do not change it.',
+      visibility: 'private',
+    });
+    await setDocAccess(workspace.admin, doc.id, [
+      { subjectType: 'user', subjectId: readerUser.id, level: 'read' },
+    ]);
+
+    expect((await getDoc(reader, doc.id)).doc.id).toBe(doc.id);
+    await expect(updateDoc(reader, doc.id, { title: 'Hijacked' })).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+    await expect(archiveDoc(reader, doc.id)).rejects.toMatchObject({ code: 'forbidden' });
+  });
+
+  it('allows an edit from somebody granted write', async () => {
+    const { principal: editor, user: editorUser } = await addMember(workspace, 'member');
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Shared draft',
+      content: 'Edit away.',
+      visibility: 'private',
+    });
+    await setDocAccess(workspace.admin, doc.id, [
+      { subjectType: 'user', subjectId: editorUser.id, level: 'write' },
+    ]);
+
+    const saved = await updateDoc(editor, doc.id, { title: 'Edited' });
+    expect(saved.doc.title).toBe('Edited');
+  });
+
+  it('leaves a workspace doc editable by anyone who may write docs', async () => {
+    const { principal: member } = await addMember(workspace, 'member');
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Handbook',
+      content: 'Everyone edits this.',
+      visibility: 'workspace',
+    });
+    const saved = await updateDoc(member, doc.id, { title: 'Handbook v2' });
+    expect(saved.doc.title).toBe('Handbook v2');
+  });
+});
+
+describe('backlinks respect who may read the linking doc', () => {
+  it('hides a private doc that links to one you can read', async () => {
+    const { doc: target } = await createDoc(workspace.admin, {
+      title: 'Deploy runbook',
+      content: 'How we ship.',
+      visibility: 'workspace',
+    });
+    await createDoc(workspace.admin, {
+      title: 'Layoff plan',
+      content: `See /docs/${target.id} before the announcement.`,
+      visibility: 'private',
+    });
+    const { principal: member } = await addMember(workspace, 'member');
+
+    const seen = await getDoc(member, target.id);
+    expect(seen.backlinks.map((link) => link.title)).not.toContain('Layoff plan');
+
+    const asAdmin = await getDoc(workspace.admin, target.id);
+    expect(asAdmin.backlinks.map((link) => link.title)).toContain('Layoff plan');
+  });
+
+  it('still shows a workspace doc that links to it', async () => {
+    const { doc: target } = await createDoc(workspace.admin, {
+      title: 'Deploy runbook',
+      content: 'How we ship.',
+      visibility: 'workspace',
+    });
+    await createDoc(workspace.admin, {
+      title: 'Onboarding',
+      content: `Read /docs/${target.id} on day one.`,
+      visibility: 'workspace',
+    });
+    const { principal: member } = await addMember(workspace, 'member');
+
+    const seen = await getDoc(member, target.id);
+    expect(seen.backlinks.map((link) => link.title)).toContain('Onboarding');
   });
 });

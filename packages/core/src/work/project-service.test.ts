@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { scopes } from '@orbit/shared/events';
+import { createTeam } from '../org/team-service.ts';
 import {
   addMember,
   createWorkspace,
@@ -12,13 +13,27 @@ import { createMilestone, listMilestones, reorderMilestones } from './milestone-
 import {
   addProjectTeam,
   createProject,
+  getProject,
   listProjects,
   listProjectTeams,
+  listProjectUpdates,
   postProjectUpdate,
   projectProgress,
   removeProjectTeam,
   updateProject,
 } from './project-service.ts';
+
+async function newIssue(
+  title: string,
+  overrides: Record<string, unknown> = {},
+): Promise<{ id: string }> {
+  const { issue } = await createIssue(workspace.admin, {
+    teamId: workspace.teamId,
+    title,
+    ...overrides,
+  });
+  return issue;
+}
 
 let workspace: Workspace;
 
@@ -168,5 +183,103 @@ describe('listProjects', () => {
   it('hides archived projects by default', async () => {
     await newProject();
     expect(await listProjects(workspace.admin)).toHaveLength(1);
+  });
+});
+
+describe('project scope maths', () => {
+  it('leaves cancelled work out of scope so a project can reach a hundred percent', async () => {
+    const { project } = await createProject(workspace.admin, {
+      name: 'Apollo',
+      teamIds: [workspace.teamId],
+    });
+
+    const shipped = await newIssue('Shipped', { projectId: project.id });
+    const dropped = await newIssue('Dropped', { projectId: project.id });
+    await newIssue('Still going', { projectId: project.id });
+
+    await updateIssue(workspace.admin, shipped.id, {
+      stateId: stateNamed(workspace, 'Done').id,
+    });
+    await updateIssue(workspace.admin, dropped.id, {
+      stateId: stateNamed(workspace, 'Canceled').id,
+    });
+
+    const progress = await projectProgress(workspace.admin, project.id);
+
+    expect(progress.scope).toBe(2);
+    expect(progress.completed).toBe(1);
+    expect(progress.canceled).toBe(1);
+  });
+
+  it('reaches a hundred percent when everything left is done', async () => {
+    const { project } = await createProject(workspace.admin, {
+      name: 'Gemini',
+      teamIds: [workspace.teamId],
+    });
+    const done = await newIssue('Done', { projectId: project.id });
+    const dropped = await newIssue('Dropped', { projectId: project.id });
+    await updateIssue(workspace.admin, done.id, { stateId: stateNamed(workspace, 'Done').id });
+    await updateIssue(workspace.admin, dropped.id, {
+      stateId: stateNamed(workspace, 'Canceled').id,
+    });
+
+    const progress = await projectProgress(workspace.admin, project.id);
+    expect(progress.completed).toBe(progress.scope);
+  });
+
+  it('hides a project from a team that does not own it', async () => {
+    const other = await createTeam(workspace.admin, { name: 'Design', key: 'DSGN' });
+    const { principal: outsider } = await addMember(workspace, 'member', {
+      teamIds: [other.team.id],
+    });
+    const { project } = await createProject(workspace.admin, {
+      name: 'Private work',
+      teamIds: [workspace.teamId],
+    });
+
+    await expect(projectProgress(outsider, project.id)).rejects.toMatchObject({
+      code: 'not_found',
+    });
+  });
+});
+
+describe('a project stays inside the teams it belongs to', () => {
+  it('hides another team’s project from a member, and from every entry point', async () => {
+    const other = await createTeam(workspace.admin, { name: 'Design', key: 'DSGN' });
+    const { project } = await createProject(workspace.admin, {
+      name: 'Rebrand',
+      teamIds: [other.team.id],
+    });
+    const { principal: engineer } = await addMember(workspace, 'member');
+
+    expect((await listProjects(engineer)).map((row) => row.id)).not.toContain(project.id);
+    await expect(getProject(engineer, project.id)).rejects.toMatchObject({ code: 'not_found' });
+    await expect(listProjectUpdates(engineer, project.id)).rejects.toMatchObject({
+      code: 'not_found',
+    });
+  });
+
+  it('still shows a project that belongs to no team in particular', async () => {
+    const { project } = await createProject(workspace.admin, { name: 'Company wiki' });
+    const { principal: engineer } = await addMember(workspace, 'member');
+    expect((await listProjects(engineer)).map((row) => row.id)).toContain(project.id);
+  });
+
+  it('refuses a status update written by somebody outside the project teams', async () => {
+    const other = await createTeam(workspace.admin, { name: 'Design', key: 'DSGN' });
+    const { project } = await createProject(workspace.admin, {
+      name: 'Rebrand',
+      teamIds: [other.team.id],
+    });
+    const { principal: lead } = await addMember(workspace, 'admin');
+    const { principal: engineer } = await addMember(workspace, 'member');
+
+    await expect(
+      postProjectUpdate(engineer, project.id, { health: 'on_track', body: 'All good.' }),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    expect(
+      (await postProjectUpdate(lead, project.id, { health: 'on_track', body: 'All good.' })).update
+        .body,
+    ).toBe('All good.');
   });
 });

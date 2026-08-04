@@ -2,14 +2,20 @@ import { describe, expect, it } from 'bun:test';
 import type { SyncAction } from '@orbit/shared/events';
 import type { Comment, DocComment, Issue } from './schemas.ts';
 import {
+  admitsNewRows,
   applyCommentDelta,
   applyDocCommentDelta,
   applyIssueDelta,
   applyIssueDeltaToPages,
   applyIssueDetailDelta,
   applyReactionDelta,
+  awaitsServerRefresh,
+  belongsInList,
   flattenIssuePages,
   mapIssuePages,
+  orderingOf,
+  searchOf,
+  sortForSearch,
   summarizeReactions,
 } from './sync.ts';
 
@@ -381,5 +387,116 @@ describe('issue pages', () => {
       TEAM,
     );
     expect(next?.pages[1]?.issues[0]?.title).toBe('Renamed');
+  });
+});
+
+describe('belongsInList', () => {
+  const base = issue({ id: 'issue_1', teamId: 'team_eng', stateId: 'state_todo' });
+
+  it('accepts anything when the search carries no scope', () => {
+    expect(belongsInList('limit=100&orderBy=manual', base)).toBe(true);
+  });
+
+  it('keeps a board column to its own status', () => {
+    expect(belongsInList('teamId=team_eng&stateId=state_todo', base)).toBe(true);
+    expect(belongsInList('teamId=team_eng&stateId=state_done', base)).toBe(false);
+  });
+
+  it('keeps a team list to its own team', () => {
+    expect(belongsInList('teamId=team_design', base)).toBe(false);
+  });
+
+  it('matches an unassigned issue only when no assignee is required', () => {
+    const unassigned = issue({ id: 'issue_2', assigneeId: null });
+    expect(belongsInList('limit=100', unassigned)).toBe(true);
+    expect(belongsInList('assigneeId=user_1', unassigned)).toBe(false);
+  });
+
+  it('reads the scope out of a query key', () => {
+    expect(searchOf(['issues', 'team_eng', 'teamId=team_eng&stateId=state_todo'])).toBe(
+      'teamId=team_eng&stateId=state_todo',
+    );
+    expect(searchOf(['issues'])).toBe('');
+  });
+});
+
+describe('a cached list keeps the order the server would return', () => {
+  it('orders by the query ordering, not by manual sortOrder', () => {
+    const older = issue({ id: 'issue_a', sortOrder: 10, updatedAt: '2026-01-01T00:00:00.000Z' });
+    const newer = issue({ id: 'issue_b', sortOrder: 90, updatedAt: '2026-06-01T00:00:00.000Z' });
+    const byUpdated = sortForSearch('orderBy=updated', [older, newer]);
+    expect(byUpdated.map((entry) => entry.id)).toEqual(['issue_b', 'issue_a']);
+
+    const byManual = sortForSearch('orderBy=manual', [newer, older]);
+    expect(byManual.map((entry) => entry.id)).toEqual(['issue_a', 'issue_b']);
+  });
+
+  it('treats an unknown or missing ordering as manual', () => {
+    expect(orderingOf('')).toBe('manual');
+    expect(orderingOf('orderBy=nonsense')).toBe('manual');
+    expect(orderingOf('orderBy=priority')).toBe('priority');
+  });
+
+  it('sorts a title ordering as text and an estimate ordering as a number', () => {
+    const b = issue({ id: 'i_b', title: 'beta', estimate: 8 });
+    const a = issue({ id: 'i_a', title: 'alpha', estimate: 21 });
+    expect(sortForSearch('orderBy=title', [b, a]).map((entry) => entry.id)).toEqual(['i_a', 'i_b']);
+    expect(sortForSearch('orderBy=estimate', [a, b]).map((entry) => entry.id)).toEqual([
+      'i_b',
+      'i_a',
+    ]);
+  });
+});
+
+describe('a filtered list never invents a row the server did not return', () => {
+  const filtered = 'teamId=team_eng&filter=cHJpb3JpdHk6dXJnZW50';
+
+  it('refuses to admit an insert it cannot check against the encoded filter', () => {
+    const incoming = issue({ id: 'issue_2', identifier: 'ENG-4' });
+    const list = [issue()];
+    expect(
+      applyIssueDelta(list, action({ action: 'insert', data: incoming }), TEAM, filtered),
+    ).toBe(list);
+  });
+
+  it('admits the same insert into a list carrying no encoded filter', () => {
+    const incoming = issue({ id: 'issue_2', identifier: 'ENG-4' });
+    const next = applyIssueDelta(
+      [issue()],
+      action({ action: 'insert', data: incoming }),
+      TEAM,
+      'teamId=team_eng',
+    );
+    expect(next).toHaveLength(2);
+  });
+
+  it('asks the server to settle the filtered list instead', () => {
+    const incoming = issue({ id: 'issue_2', identifier: 'ENG-4' });
+    const insert = action({ action: 'insert', data: incoming });
+    expect(awaitsServerRefresh([issue()], insert, TEAM, filtered)).toBe(true);
+    expect(awaitsServerRefresh([issue()], insert, TEAM, 'teamId=team_eng')).toBe(false);
+    expect(awaitsServerRefresh([issue(), incoming], insert, TEAM, filtered)).toBe(false);
+  });
+
+  it('still drops a delete from a filtered list without waiting for the server', () => {
+    const remove = action({ action: 'delete', data: { id: 'issue_1' } });
+    expect(applyIssueDelta([issue()], remove, TEAM, filtered)).toEqual([]);
+    expect(awaitsServerRefresh([issue()], remove, TEAM, filtered)).toBe(false);
+  });
+
+  it('reads the filter param, not merely any query string', () => {
+    expect(admitsNewRows('')).toBe(true);
+    expect(admitsNewRows('teamId=team_eng&orderBy=updated')).toBe(true);
+    expect(admitsNewRows('filter=')).toBe(true);
+    expect(admitsNewRows(filtered)).toBe(false);
+  });
+});
+
+describe('an ordering name from the URL cannot reach the prototype', () => {
+  it('treats an inherited property name as manual rather than crashing', () => {
+    for (const name of ['__proto__', 'toString', 'constructor', 'hasOwnProperty']) {
+      expect(orderingOf(`orderBy=${encodeURIComponent(name)}`)).toBe('manual');
+      expect(() => sortForSearch(`orderBy=${encodeURIComponent(name)}`, [issue()])).not.toThrow();
+    }
   });
 });

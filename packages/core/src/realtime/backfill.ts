@@ -1,7 +1,8 @@
-import { and, asc, db, eq, gt, or, schema } from '@orbit/db';
+import { and, asc, db, eq, gt, inArray, or, schema } from '@orbit/db';
 import type { SyncAction, SyncModel } from '@orbit/shared/events';
 import { CATCHUP_LIMIT, scopes } from '@orbit/shared/events';
-import { assertCan, type Principal } from '@orbit/shared/policy';
+import { assertCan, can, type Principal } from '@orbit/shared/policy';
+import { docReadFilter } from '../content/doc-service.ts';
 import { buildSyncAction } from './publisher.ts';
 
 export interface SyncCatchupResult {
@@ -20,6 +21,99 @@ interface BackfilledRow {
 type Loader = (principal: Principal, since: number, limit: number) => Promise<BackfilledRow[]>;
 
 const CATCHUP_ACTOR = { type: 'system', id: 'sync', name: 'Catch up' } as const;
+
+type AttachmentParent = {
+  readonly id: string;
+  readonly parentType: string;
+  readonly parentId: string;
+};
+
+function withoutBody<T extends { content: string }>(row: T): Omit<T, 'content'> {
+  const { content: _body, ...rest } = row;
+  return rest;
+}
+
+async function readableDocIds(
+  principal: Principal,
+  docIds: readonly string[],
+): Promise<Set<string>> {
+  const ids = [...new Set(docIds)];
+  if (ids.length === 0) return new Set();
+  const rows = await db
+    .select({ id: schema.doc.id })
+    .from(schema.doc)
+    .where(and(inArray(schema.doc.id, ids), docReadFilter(principal)));
+  return new Set(rows.map((row) => row.id));
+}
+
+async function issueTeamsById(issueIds: readonly string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(issueIds)];
+  if (ids.length === 0) return new Map();
+  const rows = await db
+    .select({ id: schema.issue.id, teamId: schema.issue.teamId })
+    .from(schema.issue)
+    .where(inArray(schema.issue.id, ids));
+  return new Map(rows.map((row) => [row.id, row.teamId]));
+}
+
+async function commentTeamsById(commentIds: readonly string[]): Promise<Map<string, string>> {
+  const ids = [...new Set(commentIds)];
+  if (ids.length === 0) return new Map();
+  const rows = await db
+    .select({ id: schema.comment.id, teamId: schema.issue.teamId })
+    .from(schema.comment)
+    .innerJoin(schema.issue, eq(schema.issue.id, schema.comment.issueId))
+    .where(inArray(schema.comment.id, ids));
+  return new Map(rows.map((row) => [row.id, row.teamId]));
+}
+
+async function teamsByAttachmentParent(
+  rows: readonly AttachmentParent[],
+): Promise<Map<string, string[]>> {
+  const of = (type: string) => rows.filter((row) => row.parentType === type);
+  const issueParents = of('issue');
+  const commentParents = of('comment');
+  const projectParents = of('project');
+
+  const [issueTeams, commentTeams, projectTeams] = await Promise.all([
+    issueTeamsById(issueParents.map((row) => row.parentId)),
+    commentTeamsById(commentParents.map((row) => row.parentId)),
+    teamsByProject(projectParents.map((row) => row.parentId)),
+  ]);
+
+  const byAttachment = new Map<string, string[]>();
+  for (const row of issueParents) {
+    const teamId = issueTeams.get(row.parentId);
+    if (teamId !== undefined) byAttachment.set(row.id, [teamId]);
+  }
+  for (const row of commentParents) {
+    const teamId = commentTeams.get(row.parentId);
+    if (teamId !== undefined) byAttachment.set(row.id, [teamId]);
+  }
+  for (const row of projectParents) {
+    const found = projectTeams.get(row.parentId) ?? [];
+    if (found.length > 0) byAttachment.set(row.id, found);
+  }
+  return byAttachment;
+}
+
+async function teamsByProject(
+  projectIds: readonly (string | null)[],
+): Promise<Map<string, string[]>> {
+  const ids = [...new Set(projectIds.filter((id): id is string => id !== null))];
+  const byProject = new Map<string, string[]>();
+  if (ids.length === 0) return byProject;
+  const rows = await db
+    .select({ projectId: schema.projectTeam.projectId, teamId: schema.projectTeam.teamId })
+    .from(schema.projectTeam)
+    .where(inArray(schema.projectTeam.projectId, ids));
+  for (const row of rows) {
+    const bucket = byProject.get(row.projectId) ?? [];
+    bucket.push(row.teamId);
+    byProject.set(row.projectId, bucket);
+  }
+  return byProject;
+}
 
 const LOADERS: Record<SyncModel, Loader> = {
   organization: async (principal, since, limit) =>
@@ -63,24 +157,26 @@ const LOADERS: Record<SyncModel, Loader> = {
     })),
 
   invitation: async (principal, since, limit) =>
-    (
-      await db
-        .select()
-        .from(schema.invitation)
-        .where(
-          and(
-            eq(schema.invitation.organizationId, principal.organizationId),
-            gt(schema.invitation.syncId, since),
-          ),
-        )
-        .orderBy(asc(schema.invitation.syncId))
-        .limit(limit)
-    ).map((row) => ({
-      modelId: row.id,
-      syncId: row.syncId,
-      scopes: [scopes.organization(row.organizationId)],
-      data: row,
-    })),
+    can(principal, 'member:invite')
+      ? (
+          await db
+            .select()
+            .from(schema.invitation)
+            .where(
+              and(
+                eq(schema.invitation.organizationId, principal.organizationId),
+                gt(schema.invitation.syncId, since),
+              ),
+            )
+            .orderBy(asc(schema.invitation.syncId))
+            .limit(limit)
+        ).map((row) => ({
+          modelId: row.id,
+          syncId: row.syncId,
+          scopes: [scopes.organization(row.organizationId)],
+          data: row,
+        }))
+      : [],
 
   team: async (principal, since, limit) =>
     (
@@ -166,45 +262,55 @@ const LOADERS: Record<SyncModel, Loader> = {
       data: row,
     })),
 
-  project: async (principal, since, limit) =>
-    (
-      await db
-        .select()
-        .from(schema.project)
-        .where(
-          and(
-            eq(schema.project.organizationId, principal.organizationId),
-            gt(schema.project.syncId, since),
-          ),
-        )
-        .orderBy(asc(schema.project.syncId))
-        .limit(limit)
-    ).map((row) => ({
+  project: async (principal, since, limit) => {
+    const rows = await db
+      .select()
+      .from(schema.project)
+      .where(
+        and(
+          eq(schema.project.organizationId, principal.organizationId),
+          gt(schema.project.syncId, since),
+        ),
+      )
+      .orderBy(asc(schema.project.syncId))
+      .limit(limit);
+    const teams = await teamsByProject(rows.map((row) => row.id));
+    return rows.map((row) => ({
       modelId: row.id,
       syncId: row.syncId,
-      scopes: [scopes.organization(row.organizationId), scopes.project(row.id)],
+      scopes: [
+        scopes.organization(row.organizationId),
+        scopes.project(row.id),
+        ...(teams.get(row.id) ?? []).map(scopes.team),
+      ],
       data: row,
-    })),
+    }));
+  },
 
-  milestone: async (principal, since, limit) =>
-    (
-      await db
-        .select()
-        .from(schema.milestone)
-        .where(
-          and(
-            eq(schema.milestone.organizationId, principal.organizationId),
-            gt(schema.milestone.syncId, since),
-          ),
-        )
-        .orderBy(asc(schema.milestone.syncId))
-        .limit(limit)
-    ).map((row) => ({
+  milestone: async (principal, since, limit) => {
+    const rows = await db
+      .select()
+      .from(schema.milestone)
+      .where(
+        and(
+          eq(schema.milestone.organizationId, principal.organizationId),
+          gt(schema.milestone.syncId, since),
+        ),
+      )
+      .orderBy(asc(schema.milestone.syncId))
+      .limit(limit);
+    const teams = await teamsByProject(rows.map((row) => row.projectId));
+    return rows.map((row) => ({
       modelId: row.id,
       syncId: row.syncId,
-      scopes: [scopes.organization(row.organizationId), scopes.project(row.projectId)],
+      scopes: [
+        scopes.organization(row.organizationId),
+        scopes.project(row.projectId),
+        ...(teams.get(row.projectId) ?? []).map(scopes.team),
+      ],
       data: row,
-    })),
+    }));
+  },
 
   cycle: async (principal, since, limit) =>
     (
@@ -257,8 +363,9 @@ const LOADERS: Record<SyncModel, Loader> = {
   issue_relation: async (principal, since, limit) =>
     (
       await db
-        .select()
+        .select({ row: schema.issueRelation, teamId: schema.issue.teamId })
         .from(schema.issueRelation)
+        .innerJoin(schema.issue, eq(schema.issue.id, schema.issueRelation.issueId))
         .where(
           and(
             eq(schema.issueRelation.organizationId, principal.organizationId),
@@ -267,11 +374,12 @@ const LOADERS: Record<SyncModel, Loader> = {
         )
         .orderBy(asc(schema.issueRelation.syncId))
         .limit(limit)
-    ).map((row) => ({
+    ).map(({ row, teamId }) => ({
       modelId: row.id,
       syncId: row.syncId,
       scopes: [
         scopes.organization(row.organizationId),
+        scopes.team(teamId),
         scopes.issue(row.issueId),
         scopes.issue(row.relatedIssueId),
       ],
@@ -328,20 +436,22 @@ const LOADERS: Record<SyncModel, Loader> = {
   doc_comment: async (principal, since, limit) =>
     (
       await db
-        .select()
+        .select({ row: schema.docComment })
         .from(schema.docComment)
+        .innerJoin(schema.doc, eq(schema.doc.id, schema.docComment.docId))
         .where(
           and(
             eq(schema.docComment.organizationId, principal.organizationId),
+            docReadFilter(principal),
             gt(schema.docComment.syncId, since),
           ),
         )
         .orderBy(asc(schema.docComment.syncId))
         .limit(limit)
-    ).map((row) => ({
+    ).map(({ row }) => ({
       modelId: row.id,
       syncId: row.syncId,
-      scopes: [scopes.organization(row.organizationId), scopes.doc(row.docId)],
+      scopes: [scopes.doc(row.docId)],
       data: row,
     })),
 
@@ -368,28 +478,39 @@ const LOADERS: Record<SyncModel, Loader> = {
       data: row,
     })),
 
-  attachment: async (principal, since, limit) =>
-    (
-      await db
-        .select()
-        .from(schema.attachment)
-        .where(
-          and(
-            eq(schema.attachment.organizationId, principal.organizationId),
-            gt(schema.attachment.syncId, since),
-          ),
-        )
-        .orderBy(asc(schema.attachment.syncId))
-        .limit(limit)
-    ).map((row) => ({
-      modelId: row.id,
-      syncId: row.syncId,
-      scopes:
-        row.parentType === 'doc'
-          ? [scopes.organization(row.organizationId), scopes.doc(row.parentId)]
-          : [scopes.organization(row.organizationId), scopes.issue(row.parentId)],
-      data: row,
-    })),
+  attachment: async (principal, since, limit) => {
+    const rows = await db
+      .select()
+      .from(schema.attachment)
+      .where(
+        and(
+          eq(schema.attachment.organizationId, principal.organizationId),
+          gt(schema.attachment.syncId, since),
+        ),
+      )
+      .orderBy(asc(schema.attachment.syncId))
+      .limit(limit);
+    const teams = await teamsByAttachmentParent(rows);
+    const readableDocs = await readableDocIds(
+      principal,
+      rows.filter((row) => row.parentType === 'doc').map((row) => row.parentId),
+    );
+    return rows
+      .filter((row) => row.parentType !== 'doc' || readableDocs.has(row.parentId))
+      .map((row) => ({
+        modelId: row.id,
+        syncId: row.syncId,
+        scopes:
+          row.parentType === 'doc'
+            ? [scopes.organization(row.organizationId), scopes.doc(row.parentId)]
+            : [
+                scopes.organization(row.organizationId),
+                scopes.issue(row.parentId),
+                ...(teams.get(row.id) ?? []).map(scopes.team),
+              ],
+        data: row,
+      }));
+  },
 
   doc: async (principal, since, limit) =>
     (
@@ -399,6 +520,7 @@ const LOADERS: Record<SyncModel, Loader> = {
         .where(
           and(
             eq(schema.doc.organizationId, principal.organizationId),
+            docReadFilter(principal),
             gt(schema.doc.syncId, since),
           ),
         )
@@ -415,7 +537,7 @@ const LOADERS: Record<SyncModel, Loader> = {
               scopes.doc(row.id),
               scopes.project(row.projectId),
             ],
-      data: { ...row, publishToken: row.publishToken === null ? null : 'redacted' },
+      data: { ...withoutBody(row), publishToken: row.publishToken === null ? null : 'redacted' },
     })),
 
   doc_collection: async (principal, since, limit) =>
@@ -510,9 +632,40 @@ const LOADERS: Record<SyncModel, Loader> = {
       ],
       data: row,
     })),
+
+  standup: async (principal, since, limit) =>
+    (
+      await db
+        .select()
+        .from(schema.standup)
+        .where(
+          and(
+            eq(schema.standup.organizationId, principal.organizationId),
+            gt(schema.standup.syncId, since),
+          ),
+        )
+        .orderBy(asc(schema.standup.syncId))
+        .limit(limit)
+    ).map((row) => ({
+      modelId: row.id,
+      syncId: row.syncId,
+      scopes: [scopes.organization(row.organizationId), scopes.team(row.teamId)],
+      data: row,
+    })),
 };
 
 export const SYNC_CATCHUP_MODELS = Object.keys(LOADERS) as SyncModel[];
+
+const TEAM_SCOPE_PREFIX = 'team:';
+
+export function visibleToPrincipal(principal: Principal, rowScopes: readonly string[]): boolean {
+  if (principal.role === 'admin') return true;
+  const teamScopes = rowScopes.filter((scope) => scope.startsWith(TEAM_SCOPE_PREFIX));
+  if (teamScopes.length === 0) return true;
+  return teamScopes.some((scope) =>
+    principal.teamIds.includes(scope.slice(TEAM_SCOPE_PREFIX.length)),
+  );
+}
 
 export async function catchUp(
   principal: Principal,
@@ -531,6 +684,7 @@ export async function catchUp(
   for (const { model, rows } of loaded) {
     if (rows.length > perModel) saturated = true;
     for (const row of rows.slice(0, perModel)) {
+      if (!visibleToPrincipal(principal, row.scopes)) continue;
       all.push(
         buildSyncAction({
           syncId: row.syncId,

@@ -3,7 +3,15 @@ import type { SyncAction } from '@orbit/shared/events';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render } from '@testing-library/react';
 import { clientId } from '@/lib/query/client-id.ts';
-import { BOOTSTRAP_ROOT, DOC_ROOT, DOCS_ROOT, queryKeys, VIEWS_ROOT } from '@/lib/query/keys.ts';
+import {
+  BOOTSTRAP_ROOT,
+  DOC_ROOT,
+  DOCS_ROOT,
+  ISSUE_SUMMARY_ROOT,
+  queryKeys,
+  STANDUP_ROOT,
+  VIEWS_ROOT,
+} from '@/lib/query/keys.ts';
 import type { Issue } from '@/lib/query/schemas.ts';
 import type { IssuePages } from '@/lib/query/sync.ts';
 
@@ -12,6 +20,7 @@ let capturedResume: ((since: number) => void) | null = null;
 const observed: number[] = [];
 
 mock.module('@orbit/realtime-client/react', () => ({
+  useRealtimeStatus: () => 'open',
   useScopeSubscription: () => undefined,
   useDeltaHandler: (handler: (actions: SyncAction[]) => void) => {
     capturedHandler = handler;
@@ -189,11 +198,11 @@ describe('DeltaBridge root invalidation', () => {
     expect(seen).toEqual([[DOCS_ROOT], [DOC_ROOT, 'doc_1']]);
   });
 
-  it('leaves every root alone for a delta the bridge patches in place', () => {
+  it('refreshes only the counts for an issue delta it patches in place', () => {
     const client = mount();
     const seen = trackInvalidations(client);
     act(() => capturedHandler?.([action()]));
-    expect(seen).toEqual([]);
+    expect(seen).toEqual([[ISSUE_SUMMARY_ROOT]]);
   });
 });
 
@@ -263,6 +272,19 @@ describe('DeltaBridge reconnect backfill', () => {
     expect(requested).toEqual(['/api/sync?since=17']);
     expect(titleIn(client)).toBe('Caught up');
     expect(observed).toContain(42);
-    expect(seen).toEqual([]);
+    expect(seen).toEqual([[ISSUE_SUMMARY_ROOT]]);
+  });
+});
+
+describe('DeltaBridge standup', () => {
+  it('refreshes the room when somebody else advances the standup', () => {
+    const client = mount();
+    const seen = trackInvalidations(client);
+    act(() =>
+      capturedHandler?.([
+        action({ model: 'standup', modelId: 'standup_1', data: { id: 'standup_1' } }),
+      ]),
+    );
+    expect(seen).toEqual([[STANDUP_ROOT]]);
   });
 });
