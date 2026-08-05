@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, mock } from 'bun:test';
-import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { type ReactNode, useState } from 'react';
 import { CommandPalette } from '@/components/command-palette.tsx';
 import { ShortcutsOverlay } from '@/components/shortcuts-overlay.tsx';
 import { HOTKEY_PRIORITY, HotkeyProvider, useHotkey } from '@/lib/keyboard/index.ts';
 import { buildNavigation } from '@/lib/navigation.ts';
+import { render, screen } from '@/test/render.tsx';
 
 const push = mock();
 const setTheme = mock();
@@ -89,13 +89,13 @@ describe('command palette', () => {
       /Go to Inbox/,
       /Go to My issues/,
       /Go to Projects/,
-      /Go to Cycles/,
+      /Go to Sprints/,
       /Go to Views/,
       /Go to Analytics/,
       /Go to Docs/,
       /Go to Engineering issues/,
       /Go to Engineering board/,
-      /Go to Engineering active cycle/,
+      /Go to Engineering active sprint/,
       /Go to Settings/,
     ]) {
       expect(await screen.findByRole('option', { name: label })).toBeInTheDocument();

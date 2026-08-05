@@ -1,5 +1,6 @@
 import { PRIORITIES, PRIORITY_LABELS, type Priority } from '@orbit/shared/constants';
 import type { GroupByField, IssueOrdering } from '@orbit/shared/filters';
+import { sprintLabel } from '@orbit/shared/utils';
 import type { Cycle, Issue, Label, Member, Project, WorkflowState } from '@/lib/query/schemas.ts';
 import { sortIssues } from '@/lib/query/sync.ts';
 
@@ -105,11 +106,11 @@ export function groupDefinitions(groupBy: GroupByField, context: GroupContext): 
       return [
         ...context.cycles.map((cycle) => ({
           id: cycle.id,
-          title: cycle.name.length === 0 ? `Cycle ${cycle.number}` : cycle.name,
+          title: sprintLabel(cycle),
           color: null,
           category: null,
         })),
-        unassigned('No cycle'),
+        unassigned('No sprint'),
       ];
     case 'none':
       return [{ id: 'all', title: 'All issues', color: null, category: null }];

@@ -1,4 +1,20 @@
-import { and, asc, count, db, desc, eq, gt, isNull, lt, lte, ne, schema, sql } from '@orbit/db';
+import {
+  and,
+  asc,
+  count,
+  db,
+  desc,
+  eq,
+  gt,
+  gte,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  ne,
+  schema,
+  sql,
+} from '@orbit/db';
 import { conflict } from '@orbit/shared/errors';
 import type { SyncAction } from '@orbit/shared/events';
 import { scopes } from '@orbit/shared/events';
@@ -10,6 +26,7 @@ import { addUtcDays, type Executor, newId, requireRow, startOfUtcDay } from '../
 import { requireTeam } from '../org/team-service.ts';
 import { buildSyncAction } from '../realtime/publisher.ts';
 import { nextSyncId } from '../sync/sync-id.ts';
+import { issueScopes } from './issue-service.ts';
 
 export type CycleRow = typeof schema.cycle.$inferSelect;
 
@@ -77,7 +94,7 @@ export async function createCycle(
         organizationId: principal.organizationId,
         teamId: team.id,
         number,
-        name: parsed.name ?? `Cycle ${number}`,
+        name: parsed.name ?? `Sprint ${number}`,
         startsAt: parsed.startsAt,
         endsAt: parsed.endsAt,
         syncId,
@@ -188,6 +205,13 @@ export async function deleteCycle(principal: Principal, cycleId: string): Promis
 
     const syncId = await nextSyncId(tx);
     const actor = await principalActor(tx, principal);
+
+    const detached = await tx
+      .update(schema.issue)
+      .set({ cycleId: null, updatedAt: new Date(), syncId })
+      .where(eq(schema.issue.cycleId, cycleId))
+      .returning();
+
     await tx.delete(schema.cycle).where(eq(schema.cycle.id, cycleId));
     return [
       buildSyncAction({
@@ -200,6 +224,18 @@ export async function deleteCycle(principal: Principal, cycleId: string): Promis
         data: { id: cycleId, teamId: cycle.teamId },
         actor,
       }),
+      ...detached.map((row) =>
+        buildSyncAction({
+          syncId,
+          organizationId: principal.organizationId,
+          scopes: issueScopes(row),
+          action: 'update',
+          model: 'issue',
+          modelId: row.id,
+          data: row,
+          actor,
+        }),
+      ),
     ];
   });
 }
@@ -339,6 +375,76 @@ export interface CompletedCycle {
   readonly actions: SyncAction[];
 }
 
+export interface SprintOutcome {
+  readonly scope: number;
+  readonly completed: number;
+  readonly canceled: number;
+  readonly rolledOver: number;
+  readonly points: { readonly scope: number; readonly completed: number };
+  readonly closedAt: string;
+}
+
+function outcomeOf(
+  rows: readonly { category: string; estimate: number | null }[],
+  rolledOver: number,
+  now: Date,
+): SprintOutcome {
+  const done = rows.filter((row) => row.category === 'completed');
+  const points = (list: readonly { estimate: number | null }[]) =>
+    list.reduce((total, row) => total + (row.estimate ?? 0), 0);
+  return {
+    scope: rows.length,
+    completed: done.length,
+    canceled: rows.filter((row) => row.category === 'canceled').length,
+    rolledOver,
+    points: { scope: points(rows), completed: points(done) },
+    closedAt: now.toISOString(),
+  };
+}
+
+export async function pastCycles(
+  principal: Principal,
+  teamId: string,
+  limit = 12,
+): Promise<CycleRow[]> {
+  assertCan(principal, 'project:read');
+  await requireTeam(principal, teamId);
+  return await db
+    .select()
+    .from(schema.cycle)
+    .where(
+      and(
+        eq(schema.cycle.teamId, teamId),
+        eq(schema.cycle.organizationId, principal.organizationId),
+        isNull(schema.cycle.archivedAt),
+        isNotNull(schema.cycle.completedAt),
+      ),
+    )
+    .orderBy(desc(schema.cycle.number))
+    .limit(Math.min(Math.max(limit, 1), 50));
+}
+
+export async function getCycleByNumber(
+  principal: Principal,
+  teamId: string,
+  number: number,
+): Promise<CycleRow | null> {
+  assertCan(principal, 'project:read');
+  await requireTeam(principal, teamId);
+  const [row] = await db
+    .select()
+    .from(schema.cycle)
+    .where(
+      and(
+        eq(schema.cycle.teamId, teamId),
+        eq(schema.cycle.organizationId, principal.organizationId),
+        eq(schema.cycle.number, number),
+      ),
+    )
+    .limit(1);
+  return row ?? null;
+}
+
 export async function completeCycle(
   principal: Principal,
   cycleId: string,
@@ -359,7 +465,16 @@ export async function completeCycle(
       .limit(1);
     const cycle = requireRow(found, 'That cycle does not exist.');
     assertInTeam(principal, teamScope(cycle));
-    if (cycle.completedAt !== null) throw conflict('That cycle is already complete.');
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`cycle:${cycle.teamId}`}))`);
+
+    const [locked] = await tx
+      .select({ completedAt: schema.cycle.completedAt })
+      .from(schema.cycle)
+      .where(eq(schema.cycle.id, cycleId))
+      .limit(1);
+    if (requireRow(locked, 'That cycle does not exist.').completedAt !== null) {
+      throw conflict('That cycle is already complete.');
+    }
 
     const syncId = await nextSyncId(tx);
     const actor = await principalActor(tx, principal);
@@ -367,13 +482,38 @@ export async function completeCycle(
     const [existingNext] = await tx
       .select()
       .from(schema.cycle)
-      .where(and(eq(schema.cycle.teamId, cycle.teamId), gt(schema.cycle.number, cycle.number)))
-      .orderBy(asc(schema.cycle.number))
+      .where(
+        and(
+          eq(schema.cycle.teamId, cycle.teamId),
+          isNull(schema.cycle.archivedAt),
+          isNull(schema.cycle.completedAt),
+          ne(schema.cycle.id, cycle.id),
+          gte(schema.cycle.startsAt, cycle.endsAt),
+        ),
+      )
+      .orderBy(asc(schema.cycle.startsAt))
       .limit(1);
 
     let nextCycle = existingNext;
     if (nextCycle === undefined) {
-      const number = cycle.number + 1;
+      const [latest] = await tx
+        .select({ endsAt: schema.cycle.endsAt, number: schema.cycle.number })
+        .from(schema.cycle)
+        .where(and(eq(schema.cycle.teamId, cycle.teamId), isNull(schema.cycle.archivedAt)))
+        .orderBy(desc(schema.cycle.endsAt))
+        .limit(1);
+      const [highest] = await tx
+        .select({ number: schema.cycle.number })
+        .from(schema.cycle)
+        .where(eq(schema.cycle.teamId, cycle.teamId))
+        .orderBy(desc(schema.cycle.number))
+        .limit(1);
+
+      const startsAt =
+        latest !== undefined && latest.endsAt.getTime() > cycle.endsAt.getTime()
+          ? latest.endsAt
+          : cycle.endsAt;
+      const number = (highest?.number ?? cycle.number) + 1;
       const [created] = await tx
         .insert(schema.cycle)
         .values({
@@ -381,9 +521,9 @@ export async function completeCycle(
           organizationId: cycle.organizationId,
           teamId: cycle.teamId,
           number,
-          name: `Cycle ${number}`,
-          startsAt: cycle.endsAt,
-          endsAt: addUtcDays(cycle.endsAt, 14),
+          name: `Sprint ${number}`,
+          startsAt,
+          endsAt: addUtcDays(startsAt, 14),
           syncId,
         })
         .returning();
@@ -400,6 +540,16 @@ export async function completeCycle(
         ),
       );
 
+    const atClose = await tx
+      .select({
+        stateId: schema.issue.stateId,
+        estimate: schema.issue.estimate,
+        category: schema.workflowState.category,
+      })
+      .from(schema.issue)
+      .innerJoin(schema.workflowState, eq(schema.workflowState.id, schema.issue.stateId))
+      .where(and(eq(schema.issue.cycleId, cycleId), isNull(schema.issue.archivedAt)));
+
     const rolled = await tx
       .update(schema.issue)
       .set({ cycleId: nextCycle.id, updatedAt: now, syncId })
@@ -414,7 +564,11 @@ export async function completeCycle(
 
     const [closed] = await tx
       .update(schema.cycle)
-      .set({ completedAt: now, syncId })
+      .set({
+        completedAt: now,
+        syncId,
+        progressSnapshot: { ...outcomeOf(atClose, rolled.length, now) },
+      })
       .where(eq(schema.cycle.id, cycleId))
       .returning();
     const completed = requireRow(closed, 'That cycle does not exist.');

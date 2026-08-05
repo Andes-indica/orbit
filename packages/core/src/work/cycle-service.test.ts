@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { db, eq, schema } from '@orbit/db';
 import { scopes } from '@orbit/shared/events';
+import { sprintOutcomeSchema } from '@orbit/shared/validators';
 import { cycleBurndown, teamVelocity } from '../analytics/burndown.ts';
 import { createTeam } from '../org/team-service.ts';
 import {
@@ -17,7 +18,9 @@ import {
   cycleProgress,
   deleteCycle,
   getCycle,
+  getCycleByNumber,
   listCycles,
+  pastCycles,
   upcomingCycles,
   updateCycle,
 } from './cycle-service.ts';
@@ -41,14 +44,14 @@ async function firstCycle() {
 }
 
 describe('createCycle', () => {
-  it('numbers cycles in sequence and names them', async () => {
+  it('numbers sprints in sequence and names them', async () => {
     const { cycle, actions } = await createCycle(workspace.admin, {
       teamId: workspace.teamId,
       startsAt: daysFromNow(20),
       endsAt: daysFromNow(34),
     });
     expect(cycle.number).toBe(2);
-    expect(cycle.name).toBe('Cycle 2');
+    expect(cycle.name).toBe('Sprint 2');
     expect(actions[0]?.scopes).toContain(scopes.team(workspace.teamId));
   });
 
@@ -315,5 +318,180 @@ describe('cycle writes are team scoped', () => {
     await expect(teamVelocity(outsider, workspace.teamId)).rejects.toMatchObject({
       code: 'forbidden',
     });
+  });
+});
+
+describe('a finished sprint keeps its own history', () => {
+  it('records what it shipped, because the rollover empties it of unfinished work', async () => {
+    const cycle = await firstCycle();
+    const shipped = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Shipped',
+      cycleId: cycle.id,
+      estimate: 5,
+    });
+    await updateIssue(workspace.admin, shipped.issue.id, {
+      stateId: stateNamed(workspace, 'Done').id,
+    });
+    const dropped = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Dropped',
+      cycleId: cycle.id,
+      estimate: 4,
+    });
+    await updateIssue(workspace.admin, dropped.issue.id, {
+      stateId: stateNamed(workspace, 'Canceled').id,
+    });
+    await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Not finished',
+      cycleId: cycle.id,
+      estimate: 3,
+    });
+
+    const closed = await completeCycle(workspace.admin, cycle.id);
+    expect(closed.rolledOverIssueIds).toHaveLength(1);
+
+    const outcome = sprintOutcomeSchema.parse(closed.cycle.progressSnapshot);
+    expect(outcome.scope).toBe(3);
+    expect(outcome.completed).toBe(1);
+    expect(outcome.canceled).toBe(1);
+    expect(outcome.rolledOver).toBe(1);
+    expect(outcome.points).toEqual({ scope: 12, completed: 5 });
+    expect(Number.isNaN(Date.parse(outcome.closedAt))).toBe(false);
+
+    const live = await cycleProgress(workspace.admin, cycle.id);
+    expect(live.scope).toBe(2);
+    expect(outcome.scope).toBeGreaterThan(live.scope);
+  });
+
+  it('lists finished sprints newest first, and leaves the running one out', async () => {
+    const cycle = await firstCycle();
+    await completeCycle(workspace.admin, cycle.id);
+
+    const past = await pastCycles(workspace.admin, workspace.teamId);
+    expect(past.map((row) => row.id)).toEqual([cycle.id]);
+    expect(past[0]?.completedAt).not.toBeNull();
+  });
+
+  it('finds a sprint by its number, which is the handle a url can carry', async () => {
+    const cycle = await firstCycle();
+    const found = await getCycleByNumber(workspace.admin, workspace.teamId, cycle.number);
+    expect(found?.id).toBe(cycle.id);
+    expect(await getCycleByNumber(workspace.admin, workspace.teamId, 9999)).toBeNull();
+  });
+
+  it('keeps another team out of the history it asks for', async () => {
+    const outsider = await createWorkspace('Vega');
+    await expect(pastCycles(outsider.admin, workspace.teamId)).rejects.toMatchObject({
+      code: 'not_found',
+    });
+  });
+});
+
+describe('the sprint that follows a completed one', () => {
+  it('does not overlap a sprint that already exists later in the calendar', async () => {
+    const later = await createCycle(workspace.admin, {
+      teamId: workspace.teamId,
+      startsAt: new Date('2033-04-03T00:00:00.000Z'),
+      endsAt: new Date('2033-04-17T00:00:00.000Z'),
+    });
+    const earlier = await createCycle(workspace.admin, {
+      teamId: workspace.teamId,
+      startsAt: new Date('2033-03-20T00:00:00.000Z'),
+      endsAt: new Date('2033-04-01T00:00:00.000Z'),
+    });
+
+    const closed = await completeCycle(workspace.admin, earlier.cycle.id);
+    const successor = closed.nextCycle;
+
+    const rows = await listCycles(workspace.admin, workspace.teamId);
+    const windows = rows
+      .map((row) => ({ from: row.startsAt.getTime(), to: row.endsAt.getTime() }))
+      .sort((left, right) => left.from - right.from);
+    const clashes = windows.some((window, index) => {
+      const next = windows[index + 1];
+      return next !== undefined && next.from < window.to;
+    });
+    expect(clashes).toBe(false);
+    expect(successor.id).toBe(later.cycle.id);
+  });
+
+  it('adopts the sprint already scheduled next rather than minting another', async () => {
+    const first = await createCycle(workspace.admin, {
+      teamId: workspace.teamId,
+      startsAt: new Date('2034-01-02T00:00:00.000Z'),
+      endsAt: new Date('2034-01-16T00:00:00.000Z'),
+    });
+    const planned = await createCycle(workspace.admin, {
+      teamId: workspace.teamId,
+      startsAt: new Date('2034-01-16T00:00:00.000Z'),
+      endsAt: new Date('2034-01-30T00:00:00.000Z'),
+    });
+
+    const closed = await completeCycle(workspace.admin, first.cycle.id);
+    expect(closed.nextCycle.id).toBe(planned.cycle.id);
+  });
+
+  it('numbers a minted successor above every sprint the team has', async () => {
+    const first = await firstCycle();
+    await createCycle(workspace.admin, {
+      teamId: workspace.teamId,
+      startsAt: new Date('2035-06-05T00:00:00.000Z'),
+      endsAt: new Date('2035-06-19T00:00:00.000Z'),
+    });
+    const closed = await completeCycle(workspace.admin, first.id);
+    const all = await listCycles(workspace.admin, workspace.teamId);
+    const numbers = all.map((row) => row.number);
+    expect(new Set(numbers).size).toBe(numbers.length);
+    expect(closed.nextCycle.number).toBe(Math.max(...numbers));
+  });
+});
+
+describe('two people closing the same sprint at once', () => {
+  it('lets one through, refuses the other, and leaves a single successor', async () => {
+    const cycle = await firstCycle();
+    await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Carried',
+      cycleId: cycle.id,
+    });
+
+    const outcomes = await Promise.allSettled([
+      completeCycle(workspace.admin, cycle.id),
+      completeCycle(workspace.admin, cycle.id),
+    ]);
+    const won = outcomes.filter((entry) => entry.status === 'fulfilled');
+    const lost = outcomes.filter((entry) => entry.status === 'rejected');
+    expect(won).toHaveLength(1);
+    expect(lost).toHaveLength(1);
+
+    const all = await listCycles(workspace.admin, workspace.teamId);
+    const closed = all.filter((row) => row.completedAt !== null);
+    expect(closed).toHaveLength(1);
+    expect(closed[0]?.id).toBe(cycle.id);
+
+    const recorded = sprintOutcomeSchema.parse(closed[0]?.progressSnapshot);
+    expect(recorded.rolledOver).toBe(1);
+  });
+
+  it('mints a successor when the only later sprint has already been closed', async () => {
+    const later = await createCycle(workspace.admin, {
+      teamId: workspace.teamId,
+      startsAt: new Date('2036-02-02T00:00:00.000Z'),
+      endsAt: new Date('2036-02-16T00:00:00.000Z'),
+    });
+    await completeCycle(workspace.admin, later.cycle.id);
+
+    const earlier = await createCycle(workspace.admin, {
+      teamId: workspace.teamId,
+      startsAt: new Date('2036-01-05T00:00:00.000Z'),
+      endsAt: new Date('2036-01-19T00:00:00.000Z'),
+    });
+    const closed = await completeCycle(workspace.admin, earlier.cycle.id);
+
+    expect(closed.nextCycle.id).not.toBe(later.cycle.id);
+    expect(closed.nextCycle.completedAt).toBeNull();
+    expect(closed.nextCycle.number).toBeGreaterThan(later.cycle.number);
   });
 });

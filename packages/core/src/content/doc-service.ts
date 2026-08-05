@@ -21,6 +21,7 @@ import type { Principal } from '@orbit/shared/policy';
 import { assertCan } from '@orbit/shared/policy';
 import { slugify } from '@orbit/shared/utils';
 import {
+  docAccessSetSchema,
   docCollectionCreateSchema,
   docCollectionUpdateSchema,
   docCreateSchema,
@@ -86,8 +87,10 @@ export interface SavedDocCollection {
   readonly actions: SyncAction[];
 }
 
-function docScopes(row: DocRow): string[] {
-  if (isRestricted(row.visibility)) return [scopes.user(row.authorId), scopes.doc(row.id)];
+function docScopes(row: DocRow, grantedTo: readonly string[] = []): string[] {
+  if (isRestricted(row.visibility)) {
+    return [scopes.user(row.authorId), scopes.doc(row.id), ...grantedTo];
+  }
   const list = [scopes.organization(row.organizationId), scopes.doc(row.id)];
   if (row.projectId !== null) list.push(scopes.project(row.projectId));
   return list;
@@ -227,6 +230,13 @@ export async function assertDocWritable(
   if (!isRestricted(doc.visibility)) return;
   if (await writeGrantedDocIds(executor, principal, doc.id)) return;
   throw forbidden('You only have read access to that doc.');
+}
+
+function assertMayWiden(principal: Principal, current: DocRow, next: string | undefined): void {
+  if (next === undefined) return;
+  if (!isRestricted(current.visibility) || isRestricted(next)) return;
+  if (principal.role === 'admin' || current.authorId === principal.userId) return;
+  throw forbidden('Only the author or an admin can widen who a doc is shared with.');
 }
 
 export async function loadReadableDoc(
@@ -559,6 +569,7 @@ export async function updateDoc(
     const current = await loadReadableDoc(tx, principal, docId);
     await assertDocWritable(tx, principal, current);
     if (current.archivedAt !== null) throw conflict('That doc is archived.');
+    assertMayWiden(principal, current, parsed.visibility);
     await assertPlacement(tx, principal, parsed, docId);
 
     const syncId = await nextSyncId(tx);
@@ -668,13 +679,15 @@ export async function shareDoc(
   docId: string,
   input: unknown,
 ): Promise<SharedDoc> {
-  assertCan(principal, 'doc:publish');
+  assertCan(principal, 'doc:write');
   const { visibility, rotateToken } = docShareSchema.parse(input);
+  if (isExternallyShared(visibility)) assertCan(principal, 'doc:publish');
 
   return await db.transaction(async (tx) => {
     const current = await loadReadableDoc(tx, principal, docId);
     await assertDocWritable(tx, principal, current);
     if (current.archivedAt !== null) throw conflict('That doc is archived.');
+    assertMayWiden(principal, current, visibility);
 
     const publishToken = tokenFor(visibility, rotateToken ? null : current.publishToken);
     const syncId = await nextSyncId(tx);
@@ -811,35 +824,118 @@ export async function listDocAccess(
     .orderBy(asc(schema.docAccess.createdAt));
 }
 
+async function assertSubjectsInWorkspace(
+  executor: Executor,
+  organizationId: string,
+  grants: readonly DocAccessGrant[],
+): Promise<void> {
+  const userIds = [
+    ...new Set(grants.filter((g) => g.subjectType === 'user').map((g) => g.subjectId)),
+  ];
+  const teamIds = [
+    ...new Set(grants.filter((g) => g.subjectType === 'team').map((g) => g.subjectId)),
+  ];
+
+  if (userIds.length > 0) {
+    const members = await executor
+      .select({ userId: schema.member.userId })
+      .from(schema.member)
+      .where(
+        and(
+          eq(schema.member.organizationId, organizationId),
+          inArray(schema.member.userId, userIds),
+        ),
+      );
+    if (members.length !== userIds.length) {
+      throw validationFailed('You can only share with people in this workspace.');
+    }
+  }
+
+  if (teamIds.length > 0) {
+    const teams = await executor
+      .select({ id: schema.team.id })
+      .from(schema.team)
+      .where(and(eq(schema.team.organizationId, organizationId), inArray(schema.team.id, teamIds)));
+    if (teams.length !== teamIds.length) {
+      throw validationFailed('You can only share with teams in this workspace.');
+    }
+  }
+}
+
+export interface SavedDocAccess {
+  readonly grants: (typeof schema.docAccess.$inferSelect)[];
+  readonly actions: SyncAction[];
+}
+
 export async function setDocAccess(
   principal: Principal,
   docId: string,
-  grants: readonly DocAccessGrant[],
-): Promise<(typeof schema.docAccess.$inferSelect)[]> {
+  input: unknown,
+): Promise<SavedDocAccess> {
   assertCan(principal, 'doc:write');
+  const parsed = docAccessSetSchema.parse(input);
   const doc = await loadReadableDoc(db, principal, docId);
   if (principal.role !== 'admin' && doc.authorId !== principal.userId) {
-    throw notFound('That doc does not exist.');
+    throw forbidden('Only the author or an admin can change who a doc is shared with.');
   }
 
+  const unique = new Map<string, DocAccessGrant>();
+  for (const grant of parsed.grants) {
+    unique.set(`${grant.subjectType}:${grant.subjectId}`, grant);
+  }
+  const grants = [...unique.values()];
+
   return await db.transaction(async (tx) => {
+    await assertSubjectsInWorkspace(tx, principal.organizationId, grants);
     await tx.delete(schema.docAccess).where(eq(schema.docAccess.docId, docId));
-    if (grants.length === 0) return [];
     const syncId = await nextSyncId(tx);
-    return await tx
-      .insert(schema.docAccess)
-      .values(
-        grants.map((grant) => ({
-          id: newId(),
-          organizationId: principal.organizationId,
-          docId,
-          subjectType: grant.subjectType,
-          subjectId: grant.subjectId,
-          level: grant.level,
-          grantedById: principal.userId,
-          syncId,
-        })),
-      )
+    const saved =
+      grants.length === 0
+        ? []
+        : await tx
+            .insert(schema.docAccess)
+            .values(
+              grants.map((grant) => ({
+                id: newId(),
+                organizationId: principal.organizationId,
+                docId,
+                subjectType: grant.subjectType,
+                subjectId: grant.subjectId,
+                level: grant.level,
+                grantedById: principal.userId,
+                syncId,
+              })),
+            )
+            .returning();
+
+    const [touched] = await tx
+      .update(schema.doc)
+      .set({ syncId, updatedAt: new Date() })
+      .where(eq(schema.doc.id, docId))
       .returning();
+    const row = requireRow(touched, 'That doc does not exist.');
+    const actor = await principalActor(tx, principal);
+    const reach = [
+      ...docScopes(row),
+      ...grants.map((grant) =>
+        grant.subjectType === 'user' ? scopes.user(grant.subjectId) : scopes.team(grant.subjectId),
+      ),
+    ];
+
+    return {
+      grants: saved,
+      actions: [
+        buildSyncAction({
+          syncId,
+          organizationId: principal.organizationId,
+          scopes: [...new Set(reach)],
+          action: 'update',
+          model: 'doc',
+          modelId: row.id,
+          data: docAnnouncement(row),
+          actor,
+        }),
+      ],
+    };
   });
 }

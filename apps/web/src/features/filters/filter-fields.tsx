@@ -9,6 +9,7 @@ import {
   RELATION_FILTER_VALUES,
   UNSET_FILTER_VALUE,
 } from '@orbit/shared/filters';
+import { sprintLabel } from '@orbit/shared/utils';
 import type { LucideIcon } from 'lucide-react';
 import {
   CalendarCheck,
@@ -238,10 +239,10 @@ export function buildFilterFields(
       options: [
         ...cycles.map((cycle) => ({
           value: cycle.id,
-          label: cycle.name.length === 0 ? `Cycle ${cycle.number}` : cycle.name,
+          label: sprintLabel(cycle),
           icon: glyph(RefreshCcw),
         })),
-        unsetOption('No cycle'),
+        unsetOption('No sprint'),
       ],
       facet: 'cycle',
     },

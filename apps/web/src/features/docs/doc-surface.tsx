@@ -30,6 +30,7 @@ import type { DocPatch } from '@/lib/query/use-docs.ts';
 import { useArchiveDoc, useDoc, useDocs, useUpdateDoc } from '@/lib/query/use-docs.ts';
 import { DocComments } from './doc-comments.tsx';
 import { DocEditor } from './doc-editor.tsx';
+import { DocExportMenu } from './doc-export-menu.tsx';
 import { DocHistory } from './doc-history.tsx';
 import { DocReader } from './doc-reader.tsx';
 import { DocShareMenu } from './doc-share-menu.tsx';
@@ -177,9 +178,17 @@ function LoadedDoc({
           </span>
         ) : null}
 
+        <DocExportMenu title={detail.doc.title} content={detail.doc.content} />
+
         <DocHistory docId={detail.doc.id} canWrite={canWrite} />
 
-        {canPublish ? <DocShareMenu doc={detail.doc} /> : null}
+        {canWrite ? (
+          <DocShareMenu
+            doc={detail.doc}
+            canPublish={canPublish}
+            canManageAccess={canPublish || detail.doc.authorId === workspace.userId}
+          />
+        ) : null}
 
         {canWrite ? (
           <>

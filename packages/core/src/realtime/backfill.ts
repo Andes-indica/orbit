@@ -1,4 +1,4 @@
-import { and, asc, db, eq, gt, inArray, or, schema } from '@orbit/db';
+import { and, asc, db, eq, gt, inArray, or, schema, sql } from '@orbit/db';
 import type { SyncAction, SyncModel } from '@orbit/shared/events';
 import { CATCHUP_LIMIT, scopes } from '@orbit/shared/events';
 import { assertCan, can, type Principal } from '@orbit/shared/policy';
@@ -652,6 +652,48 @@ const LOADERS: Record<SyncModel, Loader> = {
       scopes: [scopes.organization(row.organizationId), scopes.team(row.teamId)],
       data: row,
     })),
+  standup_rotation: async (principal, since, limit) => {
+    const touched = await db
+      .select({
+        teamId: schema.standupRotation.teamId,
+        syncId: sql<number>`min(${schema.standupRotation.syncId})`.as('sync_id'),
+      })
+      .from(schema.standupRotation)
+      .where(
+        and(
+          eq(schema.standupRotation.organizationId, principal.organizationId),
+          gt(schema.standupRotation.syncId, since),
+        ),
+      )
+      .groupBy(schema.standupRotation.teamId)
+      .orderBy(asc(sql`min(${schema.standupRotation.syncId})`))
+      .limit(limit);
+    if (touched.length === 0) return [];
+
+    const rows = await db
+      .select()
+      .from(schema.standupRotation)
+      .where(
+        and(
+          eq(schema.standupRotation.organizationId, principal.organizationId),
+          inArray(
+            schema.standupRotation.teamId,
+            touched.map((entry) => entry.teamId),
+          ),
+        ),
+      )
+      .orderBy(asc(schema.standupRotation.position));
+
+    return touched.map(({ teamId, syncId }) => {
+      const rotation = rows.filter((row) => row.teamId === teamId);
+      return {
+        modelId: teamId,
+        syncId,
+        scopes: [scopes.team(teamId)],
+        data: { teamId, rotation },
+      };
+    });
+  },
 };
 
 export const SYNC_CATCHUP_MODELS = Object.keys(LOADERS) as SyncModel[];

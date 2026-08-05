@@ -58,7 +58,7 @@ export function CycleAnalytics({ cycle }: { readonly cycle: CycleView }) {
       <div className="flex flex-col gap-2.5">
         <h3 className="font-medium text-dense text-text">Per assignee</h3>
         {cycle.assignees.length === 0 ? (
-          <p className="text-faint text-xs">Nothing assigned in this cycle.</p>
+          <p className="text-faint text-xs">Nothing assigned in this sprint.</p>
         ) : (
           <ul className="flex flex-col gap-2.5">
             {cycle.assignees.map((assignee) => (
@@ -137,8 +137,8 @@ export function CyclePanel({ cycle, upcoming, teamName }: CyclePanelProps) {
       {cycle === null ? (
         <EmptyState
           icon={<RefreshCcw strokeWidth={1.75} aria-hidden="true" />}
-          title="No active cycle"
-          description={`${teamName} has no cycle running right now.`}
+          title="No active sprint"
+          description={`${teamName} has no sprint running right now.`}
         />
       ) : (
         <>
@@ -157,7 +157,7 @@ export function CyclePanel({ cycle, upcoming, teamName }: CyclePanelProps) {
       )}
 
       <section className="flex flex-col gap-2">
-        <h3 className="font-medium text-dense text-text">Upcoming cycles</h3>
+        <h3 className="font-medium text-dense text-text">Upcoming sprints</h3>
         {upcoming.length === 0 ? (
           <p className="text-faint text-xs">Nothing scheduled after this one.</p>
         ) : (

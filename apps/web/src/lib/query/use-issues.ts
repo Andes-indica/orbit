@@ -42,6 +42,7 @@ import {
 } from './schemas.ts';
 import type { IssuePages } from './sync.ts';
 import {
+  admitsNewRows,
   belongsInList,
   flattenIssuePages,
   mapIssuePages,
@@ -220,30 +221,45 @@ export interface IssuePatch {
   readonly labelIds?: readonly string[];
 }
 
-type IssueListSnapshot = readonly [QueryKey, IssuePages | undefined][];
-
-function snapshotIssueLists(client: QueryClient): IssueListSnapshot {
-  return client.getQueriesData<IssuePages>({ queryKey: [ISSUES_ROOT] });
-}
-
-function restoreIssueLists(client: QueryClient, snapshot: IssueListSnapshot): void {
-  for (const [key, pages] of snapshot) client.setQueryData(key, pages);
-}
-
-function reconcile(
-  search: string,
-  issues: readonly Issue[],
-  next: Issue,
-  admit: boolean,
-): readonly Issue[] {
+function reconcile(search: string, issues: readonly Issue[], next: Issue): readonly Issue[] {
   const index = issues.findIndex((issue) => issue.id === next.id);
   if (!belongsInList(search, next)) {
     return index === -1 ? issues : issues.filter((issue) => issue.id !== next.id);
   }
-  if (index === -1) return admit ? sortForSearch(search, [...issues, next]) : issues;
-  const copy = [...issues];
-  copy[index] = next;
-  return copy;
+  if (index !== -1) {
+    const copy = [...issues];
+    copy[index] = next;
+    return sortForSearch(search, copy);
+  }
+  if (!admitsNewRows(search)) return issues;
+  return sortForSearch(search, [...issues, next]);
+}
+
+function filteredListsHolding(
+  client: QueryClient,
+  moved: readonly Issue[],
+): { key: QueryKey; held: boolean }[] {
+  const ids = new Set(moved.map((issue) => issue.id));
+  return client
+    .getQueriesData<IssuePages>({ queryKey: [ISSUES_ROOT] })
+    .filter(([key]) => !admitsNewRows(searchOf(key)))
+    .map(([key, pages]) => ({
+      key,
+      held: pages !== undefined && flattenIssuePages(pages).some((issue) => ids.has(issue.id)),
+    }));
+}
+
+function settleFilteredLists(
+  client: QueryClient,
+  moved: readonly Issue[],
+  before: readonly { key: QueryKey; held: boolean }[],
+): void {
+  for (const { key, held } of before) {
+    const search = searchOf(key);
+    const belongsNow = moved.some((issue) => belongsInList(search, issue));
+    if (!(held || belongsNow)) continue;
+    client.invalidateQueries({ queryKey: key }).catch(() => undefined);
+  }
 }
 
 function eachIssueList(
@@ -266,24 +282,30 @@ function patchIssueLists(
   eachIssueList(client, { queryKey: [ISSUES_ROOT] }, (issues) => update(issues));
 }
 
-function placeIssue(client: QueryClient, next: Issue): void {
+function placeIssue(client: QueryClient, next: Issue, settle = true): void {
+  const before = filteredListsHolding(client, [next]);
   eachIssueList(client, { queryKey: [ISSUES_ROOT] }, (issues, search) =>
-    reconcile(search, issues, next, false),
+    reconcile(search, issues, next),
   );
+  if (settle) settleFilteredLists(client, [next], before);
 }
 
 function placeIssues(client: QueryClient, moved: readonly Issue[]): void {
+  const before = filteredListsHolding(client, moved);
   eachIssueList(client, { queryKey: [ISSUES_ROOT] }, (issues, search) => {
     let next = issues;
-    for (const issue of moved) next = reconcile(search, next, issue, false);
+    for (const issue of moved) next = reconcile(search, next, issue);
     return sortForSearch(search, next);
   });
+  settleFilteredLists(client, moved, before);
 }
 
-function addToTeamLists(client: QueryClient, teamId: string, next: Issue): void {
-  eachIssueList(client, { queryKey: queryKeys.issueTeam(teamId) }, (issues, search) =>
-    reconcile(search, issues, next, true),
+function addToLists(client: QueryClient, next: Issue): void {
+  const before = filteredListsHolding(client, [next]);
+  eachIssueList(client, { queryKey: [ISSUES_ROOT] }, (issues, search) =>
+    reconcile(search, issues, next),
   );
+  settleFilteredLists(client, [next], before);
 }
 
 function refreshCounts(client: QueryClient): void {
@@ -310,7 +332,6 @@ export function useUpdateIssue(_teamId: string) {
     },
     onMutate: async (input) => {
       await client.cancelQueries({ queryKey: [ISSUES_ROOT] });
-      const previous = snapshotIssueLists(client);
       const previousDetail = client.getQueryData<IssueDetail>(
         queryKeys.issue(input.issue.identifier),
       );
@@ -321,7 +342,7 @@ export function useUpdateIssue(_teamId: string) {
         labelIds:
           input.patch.labelIds === undefined ? input.issue.labelIds : [...input.patch.labelIds],
       };
-      placeIssue(client, optimistic);
+      placeIssue(client, optimistic, false);
       if (previousDetail !== undefined) {
         client.setQueryData(queryKeys.issue(input.issue.identifier), {
           ...previousDetail,
@@ -331,10 +352,10 @@ export function useUpdateIssue(_teamId: string) {
           },
         });
       }
-      return { previous, previousDetail, identifier: input.issue.identifier };
+      return { previousDetail, identifier: input.issue.identifier };
     },
-    onError: (error, _input, context) => {
-      if (context?.previous !== undefined) restoreIssueLists(client, context.previous);
+    onError: (error, input, context) => {
+      placeIssue(client, input.issue);
       if (context?.previousDetail !== undefined && context.identifier !== undefined) {
         client.setQueryData(queryKeys.issue(context.identifier), context.previousDetail);
       }
@@ -373,17 +394,16 @@ export function useMoveIssue(teamId: string) {
     },
     onMutate: async (input) => {
       await client.cancelQueries({ queryKey: [ISSUES_ROOT] });
-      const previous = snapshotIssueLists(client);
       const optimistic: Issue = {
         ...input.issue,
         stateId: input.stateId,
         sortOrder: sortOrderBetween(input.beforeOrder, input.afterOrder),
       };
-      placeIssue(client, optimistic);
-      return { previous };
+      placeIssue(client, optimistic, false);
+      return {};
     },
-    onError: (error, _input, context) => {
-      if (context?.previous !== undefined) restoreIssueLists(client, context.previous);
+    onError: (error, input) => {
+      placeIssue(client, input.issue);
       toast({ title: 'Could not move that issue', description: messageOf(error), tone: 'danger' });
     },
     onSuccess: (moved) => {
@@ -409,7 +429,7 @@ export interface CreateIssueInput {
   readonly labelIds: readonly string[];
 }
 
-export function useCreateIssue(teamId: string) {
+export function useCreateIssue(_teamId: string) {
   const client = useQueryClient();
   const { toast } = useToast();
 
@@ -429,7 +449,7 @@ export function useCreateIssue(teamId: string) {
       });
     },
     onSuccess: (issue) => {
-      addToTeamLists(client, teamId, issue);
+      addToLists(client, issue);
       refreshCounts(client);
     },
   });
@@ -447,12 +467,11 @@ export function useDeleteIssue(_teamId: string) {
     },
     onMutate: async (issue) => {
       await client.cancelQueries({ queryKey: [ISSUES_ROOT] });
-      const previous = snapshotIssueLists(client);
       patchIssueLists(client, (issues) => issues.filter((entry) => entry.id !== issue.id));
-      return { previous };
+      return {};
     },
-    onError: (error, _issue, context) => {
-      if (context?.previous !== undefined) restoreIssueLists(client, context.previous);
+    onError: (error, issue) => {
+      addToLists(client, issue);
       toast({ title: 'Could not delete', description: messageOf(error), tone: 'danger' });
     },
     onSettled: (_data, _error, issue) => {
