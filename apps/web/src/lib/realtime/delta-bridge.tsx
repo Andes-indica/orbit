@@ -20,9 +20,11 @@ import {
   DOC_COMMENTS_ROOT,
   DOC_ROOT,
   DOCS_ROOT,
+  ISSUE_FACETS_ROOT,
   ISSUE_ROOT,
   ISSUE_SUMMARY_ROOT,
   ISSUES_ROOT,
+  PROJECT_SCOPE,
   STANDUP_ROOT,
   VIEWS_ROOT,
 } from '@/lib/query/keys.ts';
@@ -77,6 +79,11 @@ function membershipOf(key: QueryKey): IssueBelongs | null {
     const userId = key[2];
     if (typeof userId !== 'string') return null;
     return (issue: Issue) => issue.assigneeId === userId && belongsInList(search, issue);
+  }
+  if (scope === PROJECT_SCOPE) {
+    const projectId = key[2];
+    if (typeof projectId !== 'string') return null;
+    return (issue: Issue) => issue.projectId === projectId && belongsInList(search, issue);
   }
   if (scope === ALL_SCOPE) return (issue: Issue) => belongsInList(search, issue);
   return (issue: Issue) => issue.teamId === scope && belongsInList(search, issue);
@@ -193,7 +200,10 @@ function routeAction(
 }
 
 function flushRoots(client: QueryClient, roots: RootInvalidations): void {
-  if (roots.counts) client.invalidateQueries({ queryKey: [ISSUE_SUMMARY_ROOT] }).catch(noop);
+  if (roots.counts) {
+    client.invalidateQueries({ queryKey: [ISSUE_SUMMARY_ROOT] }).catch(noop);
+    client.invalidateQueries({ queryKey: [ISSUE_FACETS_ROOT] }).catch(noop);
+  }
   if (roots.standup) client.invalidateQueries({ queryKey: [STANDUP_ROOT] }).catch(noop);
   if (roots.bootstrap) client.invalidateQueries({ queryKey: [BOOTSTRAP_ROOT] }).catch(noop);
   if (roots.views) client.invalidateQueries({ queryKey: [VIEWS_ROOT] }).catch(noop);

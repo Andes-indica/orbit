@@ -2,6 +2,7 @@
 
 import { useScopeSubscription } from '@orbit/realtime-client/react';
 import { scopes } from '@orbit/shared/events';
+import { DOC_CONTENT_LIMIT } from '@orbit/shared/validators';
 import { Archive, Check, FolderInput, Indent, PanelLeft, Pencil, Search } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import {
@@ -25,14 +26,16 @@ import { Kbd } from '@/components/ui/kbd.tsx';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover.tsx';
 import { Skeleton } from '@/components/ui/skeleton.tsx';
 import { useWorkspace } from '@/features/issues/workspace-provider.tsx';
+import { cn } from '@/lib/cn.ts';
 import type { Doc, DocDetail, DocSummary } from '@/lib/query/schemas.ts';
 import type { DocPatch } from '@/lib/query/use-docs.ts';
 import { useArchiveDoc, useDoc, useDocs, useUpdateDoc } from '@/lib/query/use-docs.ts';
+import { DocAttachments } from './doc-attachments.tsx';
 import { DocComments } from './doc-comments.tsx';
 import { DocEditor } from './doc-editor.tsx';
 import { DocExportMenu } from './doc-export-menu.tsx';
 import { DocHistory } from './doc-history.tsx';
-import { DocReader } from './doc-reader.tsx';
+import { DocBacklinks, DocContextRow, DocReader } from './doc-reader.tsx';
 import { DocShareMenu } from './doc-share-menu.tsx';
 import type { SaveStatus } from './use-autosave.ts';
 import { useAutosave } from './use-autosave.ts';
@@ -43,7 +46,10 @@ const STATUS_LABEL = {
   unsaved: 'Unsaved changes',
   saving: 'Saving…',
   error: 'Save failed',
+  blocked: 'Too long to save',
 } as const;
+
+const NEAR_LIMIT = Math.round(DOC_CONTENT_LIMIT * 0.9);
 
 const NEST_PICKER_LIMIT = 50;
 
@@ -58,6 +64,16 @@ export function matchParents(
       ? parents
       : parents.filter((entry) => (entry.title ?? '').toLowerCase().includes(query));
   return { shown: matches.slice(0, limit), hiddenCount: Math.max(matches.length - limit, 0) };
+}
+
+export interface DocDraft {
+  readonly title: string;
+  readonly content: string;
+}
+
+export function adoptsRemoteEdit(settled: boolean, seen: DocDraft, incoming: DocDraft): boolean {
+  if (seen.title === incoming.title && seen.content === incoming.content) return false;
+  return settled;
 }
 
 export function descendantIds(docs: readonly DocSummary[], rootId: string): Set<string> {
@@ -87,7 +103,6 @@ export interface DocSurfaceProps {
   readonly docId: string;
   readonly canWrite: boolean;
   readonly canPublish: boolean;
-  readonly startEditing: boolean;
 }
 
 function useDocList() {
@@ -131,7 +146,6 @@ function LoadedDoc({
   detail,
   canWrite,
   canPublish,
-  startEditing,
 }: DocSurfaceProps & { readonly detail: DocDetail }) {
   const router = useRouter();
   const workspace = useWorkspace();
@@ -139,13 +153,12 @@ function LoadedDoc({
   const { toggle, setUnsavedDocId } = useDocsTree();
   const update = useUpdateDoc(detail.doc.id);
   const archive = useArchiveDoc();
-  const [editing, setEditing] = useState(startEditing && canWrite);
   const [status, setStatus] = useState<SaveStatus>('saved');
 
   useEffect(() => {
-    setUnsavedDocId(editing && status !== 'saved' ? detail.doc.id : null);
+    setUnsavedDocId(canWrite && status !== 'saved' ? detail.doc.id : null);
     return () => setUnsavedDocId(null);
-  }, [editing, status, detail.doc.id, setUnsavedDocId]);
+  }, [canWrite, status, detail.doc.id, setUnsavedDocId]);
 
   const collectionName =
     collections.find((entry) => entry.id === detail.doc.collectionId)?.name ?? null;
@@ -169,7 +182,7 @@ function LoadedDoc({
 
         <p className="min-w-0 flex-1 truncate text-dense text-muted">{detail.doc.title}</p>
 
-        {canWrite && editing ? (
+        {canWrite ? (
           <span
             data-testid="doc-save-status"
             className={status === 'error' ? 'text-2xs text-danger' : 'text-2xs text-faint'}
@@ -242,15 +255,6 @@ function LoadedDoc({
             </Button>
 
             <Button
-              variant={editing ? 'primary' : 'secondary'}
-              size="sm"
-              data-testid="doc-edit-toggle"
-              onClick={() => setEditing((value) => !value)}
-            >
-              {editing ? 'Done' : 'Edit'}
-            </Button>
-
-            <Button
               variant="primary"
               size="sm"
               data-testid="new-doc"
@@ -264,8 +268,21 @@ function LoadedDoc({
         ) : null}
       </div>
 
-      {editing ? (
-        <EditSession doc={detail.doc} save={update.mutateAsync} onStatusChange={setStatus} />
+      {canWrite ? (
+        <EditSession
+          doc={detail.doc}
+          save={update.mutateAsync}
+          onStatusChange={setStatus}
+          collectionName={collectionName}
+          projectName={projectName}
+          footer={
+            <div className="mt-10 border-border border-t pt-6">
+              <DocAttachments attachments={detail.attachments} />
+              <DocBacklinks backlinks={detail.backlinks} />
+              <DocComments docId={detail.doc.id} members={workspace.members} />
+            </div>
+          }
+        />
       ) : (
         <div className="min-h-0 flex-1 scroll-smooth overflow-y-auto motion-reduce:scroll-auto">
           <DocReader
@@ -418,23 +435,46 @@ function EditSession({
   doc,
   save,
   onStatusChange,
+  collectionName,
+  projectName,
+  footer,
 }: {
   readonly doc: Doc;
   readonly save: (patch: DocPatch) => Promise<unknown>;
   readonly onStatusChange: (status: SaveStatus) => void;
+  readonly collectionName: string | null;
+  readonly projectName: string | null;
+  readonly footer?: React.ReactNode;
 }) {
   const [title, setTitle] = useState(doc.title);
   const [content, setContent] = useState(doc.content);
   const draft = useMemo(() => ({ title, content }), [title, content]);
-  const autosave = useAutosave({ value: draft, save });
+  const autosave = useAutosave({
+    value: draft,
+    save,
+    canSave: (next) => next.content.length <= DOC_CONTENT_LIMIT,
+  });
   const flush = autosave.saveNow;
+  const over = content.length > DOC_CONTENT_LIMIT;
+  const near = content.length > NEAR_LIMIT;
+  const settled = autosave.status === 'saved';
+  const server = useRef({ title: doc.title, content: doc.content });
 
   useEffect(() => onStatusChange(autosave.status), [autosave.status, onStatusChange]);
   useEffect(() => flush, [flush]);
 
+  useEffect(() => {
+    const incoming = { title: doc.title, content: doc.content };
+    if (!adoptsRemoteEdit(settled, server.current, incoming)) return;
+    server.current = incoming;
+    setTitle(incoming.title);
+    setContent(incoming.content);
+  }, [doc.title, doc.content, settled]);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="border-border border-b px-6 pt-5 pb-3">
+      <div className="flex flex-col gap-3 border-border border-b px-6 pt-5 pb-3">
+        <DocContextRow doc={doc} collectionName={collectionName} projectName={projectName} />
         <Input
           value={title}
           aria-label="Doc title"
@@ -443,7 +483,26 @@ function EditSession({
           className="h-auto border-0 bg-transparent px-0 font-semibold text-text text-xl focus-visible:border-0"
         />
       </div>
-      <DocEditor docId={doc.id} content={content} onChange={setContent} onForceSave={flush} />
+      <DocEditor
+        docId={doc.id}
+        content={content}
+        onChange={setContent}
+        onForceSave={flush}
+        footer={footer}
+      />
+      {near ? (
+        <p
+          data-testid="doc-length-warning"
+          className={cn(
+            'shrink-0 border-border border-t px-6 py-2 text-2xs tabular-nums',
+            over ? 'text-danger' : 'text-muted',
+          )}
+        >
+          {over
+            ? `This document is ${content.length.toLocaleString()} characters, past the ${DOC_CONTENT_LIMIT.toLocaleString()} limit. Nothing is being saved until it is shorter. Split it into linked pages.`
+            : `${content.length.toLocaleString()} of ${DOC_CONTENT_LIMIT.toLocaleString()} characters.`}
+        </p>
+      ) : null}
     </div>
   );
 }
