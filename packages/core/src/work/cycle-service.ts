@@ -7,6 +7,7 @@ import {
   eq,
   gt,
   gte,
+  inArray,
   isNotNull,
   isNull,
   lt,
@@ -21,6 +22,7 @@ import { scopes } from '@orbit/shared/events';
 import type { Principal } from '@orbit/shared/policy';
 import { assertCan, assertInTeam, teamScope } from '@orbit/shared/policy';
 import { cycleCreateSchema, cycleUpdateSchema } from '@orbit/shared/validators';
+import { z } from 'zod';
 import { principalActor } from '../activity/activity-service.ts';
 import { addUtcDays, type Executor, newId, requireRow, startOfUtcDay } from '../internal.ts';
 import { requireTeam } from '../org/team-service.ts';
@@ -400,6 +402,83 @@ function outcomeOf(
     points: { scope: points(rows), completed: points(done) },
     closedAt: now.toISOString(),
   };
+}
+
+function readStoredOutcome(value: unknown): SprintOutcome | null {
+  const parsed = storedOutcomeSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+const storedOutcomeSchema = z.object({
+  scope: z.number(),
+  completed: z.number(),
+  canceled: z.number().default(0),
+  rolledOver: z.number().default(0),
+  points: z
+    .object({ scope: z.number(), completed: z.number() })
+    .default({ scope: 0, completed: 0 }),
+  closedAt: z.string(),
+});
+
+export interface RecordedOutcome extends SprintOutcome {
+  readonly reconstructed: boolean;
+}
+
+export async function sprintOutcome(
+  principal: Principal,
+  cycleId: string,
+): Promise<RecordedOutcome | null> {
+  const cycle = await getCycle(principal, cycleId);
+  const [outcome] = await outcomesFor([cycle]);
+  return outcome ?? null;
+}
+
+export async function sprintOutcomes(
+  principal: Principal,
+  cycles: readonly CycleRow[],
+): Promise<(RecordedOutcome | null)[]> {
+  assertCan(principal, 'project:read');
+  return await outcomesFor(cycles);
+}
+
+async function outcomesFor(cycles: readonly CycleRow[]): Promise<(RecordedOutcome | null)[]> {
+  const needsCounting = cycles.filter(
+    (cycle) => cycle.completedAt !== null && readStoredOutcome(cycle.progressSnapshot) === null,
+  );
+
+  const counted = new Map<string, { category: string; estimate: number | null }[]>();
+  if (needsCounting.length > 0) {
+    const rows = await db
+      .select({
+        cycleId: schema.issue.cycleId,
+        category: CYCLE_CATEGORY,
+        estimate: schema.issue.estimate,
+      })
+      .from(schema.issue)
+      .innerJoin(schema.workflowState, eq(schema.workflowState.id, schema.issue.stateId))
+      .where(
+        and(
+          inArray(
+            schema.issue.cycleId,
+            needsCounting.map((cycle) => cycle.id),
+          ),
+          isNull(schema.issue.archivedAt),
+        ),
+      );
+    for (const row of rows) {
+      if (row.cycleId === null) continue;
+      const list = counted.get(row.cycleId) ?? [];
+      list.push({ category: row.category, estimate: row.estimate });
+      counted.set(row.cycleId, list);
+    }
+  }
+
+  return cycles.map((cycle) => {
+    if (cycle.completedAt === null) return null;
+    const stored = readStoredOutcome(cycle.progressSnapshot);
+    if (stored !== null) return { ...stored, reconstructed: false };
+    return { ...outcomeOf(counted.get(cycle.id) ?? [], 0, cycle.completedAt), reconstructed: true };
+  });
 }
 
 export async function pastCycles(
