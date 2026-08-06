@@ -25,6 +25,7 @@ import { EditorToolbar } from './editor-toolbar.tsx';
 import { editorExtensions, type MenuKey, type MenuKeyHandlerRef } from './extensions.ts';
 import { docToMarkdown } from './markdown.ts';
 import { editorSurfaceClassName } from './styles.ts';
+import { TableControls } from './table-controls.tsx';
 
 export interface UploadedAttachment {
   readonly url: string;
@@ -88,6 +89,11 @@ function caretPosition(editor: Editor, at: number, container: HTMLElement | null
   return { left: coords.left - box.left, top: coords.bottom - box.top + 6 };
 }
 
+function tableAnchor(editor: Editor, container: HTMLElement | null): MenuPosition | null {
+  if (!(editor.isEditable && editor.isActive('table'))) return null;
+  return caretPosition(editor, editor.state.selection.from, container);
+}
+
 export function settledMarkdown(markdown: string): string {
   return markdown.replace(/\n+$/, '');
 }
@@ -130,6 +136,7 @@ export function RichTextEditor({
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [highlight, setHighlight] = useState(0);
   const [bubble, setBubble] = useState<MenuPosition | null>(null);
+  const [tableMenu, setTableMenu] = useState<MenuPosition | null>(null);
   const [link, setLink] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const listId = useId();
@@ -222,6 +229,8 @@ export function RichTextEditor({
         highlightRef.current = 0;
         setHighlight(0);
       }
+
+      setTableMenu(tableAnchor(editor, containerRef.current));
 
       const { from, to, empty } = editor.state.selection;
       if (empty || editor.isActive('codeBlock')) {
@@ -437,6 +446,8 @@ export function RichTextEditor({
       {uploading ? (
         <p className="absolute right-2 bottom-2 text-2xs text-faint">Uploading…</p>
       ) : null}
+
+      <TableControls editor={editor} anchor={tableMenu} testId={`${testId}-table-menu`} />
 
       {bubble === null || editor === null ? null : (
         <SelectionBubble

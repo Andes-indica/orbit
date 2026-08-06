@@ -85,7 +85,7 @@ function commentPayload(anchor: DocCommentAnchor | null) {
   };
 }
 
-function stubFetch(anchor: DocCommentAnchor | null): void {
+function stubFetch(anchor: DocCommentAnchor | null, access: 'read' | 'write'): void {
   globalThis.fetch = mock((input: string | URL | Request) => {
     const url = String(input);
     const body = (() => {
@@ -98,6 +98,7 @@ function stubFetch(anchor: DocCommentAnchor | null): void {
           author: { id: 'user_1', name: 'Ada', image: null },
           followers: 1,
           backlinks: [],
+          access,
         };
       }
       if (url.startsWith('/api/docs')) {
@@ -132,8 +133,8 @@ function marks(commentId: string): Element[] {
 }
 
 async function open(canWrite: boolean, anchor: DocCommentAnchor | null) {
-  stubFetch(anchor);
-  render(wrap(<DocSurface docId="doc_1" canWrite={canWrite} canPublish={false} />));
+  stubFetch(anchor, canWrite ? 'write' : 'read');
+  render(wrap(<DocSurface docId="doc_1" canWriteDocs={canWrite} canPublish={false} />));
   await screen.findByTestId('doc-comments');
 }
 
