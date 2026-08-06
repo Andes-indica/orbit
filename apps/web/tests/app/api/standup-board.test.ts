@@ -98,34 +98,26 @@ async function seedIssuesWithLabels(): Promise<void> {
       color: '#3E63DD',
     },
   ]);
+  await db.insert(schema.member).values({
+    id: `member_${randomUUID()}`,
+    organizationId: seeded.organizationId,
+    userId: seeded.userId,
+    role: 'admin',
+  });
+  await db
+    .insert(schema.teamMember)
+    .values({ id: `tm_${randomUUID()}`, teamId: seeded.teamId, userId: seeded.userId });
 }
 
 const session = {
-  user: { id: 'user_1', name: 'Ada Admin', email: 'ada@orbit.test' },
-  session: { activeOrganizationId: 'org_1' },
+  user: { id: seeded.userId, name: 'Board Author', email: `${seeded.userId}@orbit.test` },
+  session: { activeOrganizationId: seeded.organizationId },
 };
 const sessionHolder: { value: typeof session | null } = { value: session };
 
 mock.module('@/lib/auth/session.ts', () => ({
   getSession: () => Promise.resolve(sessionHolder.value),
   requireSession: () => Promise.resolve(sessionHolder.value),
-}));
-
-const principal: Principal = {
-  userId: 'user_1',
-  organizationId: 'org_1',
-  role: 'admin',
-  teamIds: ['team_1'],
-};
-
-mock.module('@/lib/auth/principal.ts', () => ({
-  resolveMembership: () =>
-    Promise.resolve({
-      principal,
-      memberId: 'member_1',
-      organizationName: 'Nova',
-      organizationSlug: 'nova',
-    }),
 }));
 
 const { GET } = await import('../../../src/app/api/standup/board/route.ts');
@@ -209,6 +201,23 @@ describe('GET /api/standup/board', () => {
       [seeded.bugLabelId, seeded.uiLabelId].sort(),
     );
     expect(payload.issues[1]?.labelIds).toEqual([]);
+  });
+
+  it('never borrows a label from an issue the board did not return', async () => {
+    await db.insert(schema.issueLabel).values([
+      {
+        id: `issue_label_${randomUUID()}`,
+        issueId: seeded.labelledIssueId,
+        labelId: seeded.bugLabelId,
+      },
+    ]);
+    board.issues = [{ id: seeded.plainIssueId, title: 'Fix the socket', assigneeId: 'user_2' }];
+
+    const response = await GET(new Request(BASE));
+    const payload = payloadSchema.parse(await response.json());
+
+    expect(payload.issues).toHaveLength(1);
+    expect(payload.issues[0]?.labelIds).toEqual([]);
   });
 
   it('falls back to the service defaults when no query string is sent', async () => {
