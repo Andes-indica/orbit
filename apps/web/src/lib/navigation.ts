@@ -56,7 +56,7 @@ const TEAM_SECTION_PREFIX = 'team-';
 
 const WORKSPACE_LINKS: readonly NavLink[] = [
   { href: '/projects', label: 'Projects', icon: FolderKanban, binding: 'g p' },
-  { href: '/sprints', label: 'Sprints', icon: RefreshCcw },
+  { href: '/sprints', label: 'Sprints', icon: RefreshCcw, binding: 'g t' },
   { href: '/standup', label: 'Standup', icon: Users, binding: 'g s' },
   { href: '/views', label: 'Views', icon: LayoutList, binding: 'g v' },
   { href: '/analytics', label: 'Analytics', icon: BarChart3, binding: 'g a' },

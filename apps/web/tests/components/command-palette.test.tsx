@@ -69,6 +69,16 @@ function ArchiveIssue({ enabled }: { readonly enabled: boolean }) {
   return null;
 }
 
+function StandupTimer({ run }: { readonly run: () => void }) {
+  useHotkey('t', run, {
+    label: 'Toggle timer',
+    section: 'Standup',
+    scope: 'standup',
+    priority: HOTKEY_PRIORITY.surface,
+  });
+  return null;
+}
+
 async function select(name: RegExp) {
   await userEvent.setup().click(await screen.findByRole('option', { name }));
 }
@@ -112,6 +122,31 @@ describe('command palette', () => {
     push.mockClear();
     await user.keyboard('gi');
     expect(push).toHaveBeenCalledWith('/inbox');
+  });
+
+  it('routes to sprints when the binding gt is pressed, even with a competing t binding', async () => {
+    const user = userEvent.setup();
+    const toggleTimer = mock();
+
+    render(
+      <Palette startOpen>
+        <StandupTimer run={toggleTimer} />
+      </Palette>,
+    );
+
+    await select(/Go to Sprints/);
+    expect(push).toHaveBeenCalledWith('/sprints');
+
+    push.mockClear();
+
+    await user.keyboard('t');
+    expect(toggleTimer).toHaveBeenCalledTimes(1);
+
+    toggleTimer.mockClear();
+
+    await user.keyboard('gt');
+    expect(push).toHaveBeenCalledWith('/sprints');
+    expect(toggleTimer).not.toHaveBeenCalled();
   });
 
   it('runs the toggles it advertises', async () => {
