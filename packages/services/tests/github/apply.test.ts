@@ -111,6 +111,7 @@ function prEvent(overrides: {
   state?: 'open' | 'closed';
   title?: string;
   headRef?: string;
+  body?: string;
 }): { eventName: string; body: unknown } {
   return {
     eventName: 'pull_request',
@@ -119,6 +120,7 @@ function prEvent(overrides: {
       pull_request: {
         number: 7,
         title: overrides.title ?? 'Rework dashboard',
+        body: overrides.body ?? null,
         html_url: 'https://github.com/acme/web/pull/7',
         draft: overrides.draft ?? false,
         merged: overrides.merged ?? false,
@@ -163,6 +165,89 @@ describe('applyGithubEvent', () => {
       });
       expect(result.handled).toBe(false);
       expect(result.actions).toHaveLength(0);
+    });
+  });
+
+  it('ignores an identifier that is only mentioned, not declared', async () => {
+    await withRollback(async (tx) => {
+      const fixture = await seed(tx);
+
+      const result = await applyGithubEvent(
+        tx,
+        prEvent({
+          headRef: 'chore/tidy',
+          title: 'Tidy the dashboard',
+          body: 'This looks a lot like ENG-3 but is a separate piece of work.',
+        }),
+      );
+
+      expect(result.handled).toBe(true);
+      const links = await tx.select().from(gitLink).where(eq(gitLink.issueId, fixture.issueId));
+      expect(links).toHaveLength(0);
+    });
+  });
+
+  it('ignores an identifier inside a code block, a comment or a quote', async () => {
+    await withRollback(async (tx) => {
+      const fixture = await seed(tx);
+
+      const result = await applyGithubEvent(
+        tx,
+        prEvent({
+          headRef: 'chore/tidy',
+          title: 'Tidy the dashboard',
+          body: [
+            '<!-- Template: write "Fixes ENG-3" here -->',
+            '```',
+            'git checkout -b fixes-eng-3',
+            '```',
+            'Inline `Fixes ENG-3` in backticks.',
+            '> Somebody quoted: Fixes ENG-3',
+          ].join('\n'),
+        }),
+      );
+
+      expect(result.handled).toBe(true);
+      const links = await tx.select().from(gitLink).where(eq(gitLink.issueId, fixture.issueId));
+      expect(links).toHaveLength(0);
+    });
+  });
+
+  it('links an issue named only in the pull request description', async () => {
+    await withRollback(async (tx) => {
+      const fixture = await seed(tx);
+
+      const result = await applyGithubEvent(
+        tx,
+        prEvent({
+          headRef: 'chore/no-identifier-here',
+          title: 'Tidy the dashboard',
+          body: 'Rewrites the panel.\n\nFixes ENG-3, which nothing else in this PR names.',
+        }),
+      );
+
+      expect(result.handled).toBe(true);
+      const links = await tx.select().from(gitLink).where(eq(gitLink.issueId, fixture.issueId));
+      expect(links).toHaveLength(1);
+    });
+  });
+
+  it('still links nothing when no identifier appears anywhere, description included', async () => {
+    await withRollback(async (tx) => {
+      const fixture = await seed(tx);
+
+      const result = await applyGithubEvent(
+        tx,
+        prEvent({
+          headRef: 'chore/tidy',
+          title: 'Tidy the dashboard',
+          body: 'No identifier in here at all.',
+        }),
+      );
+
+      expect(result.handled).toBe(true);
+      const links = await tx.select().from(gitLink).where(eq(gitLink.issueId, fixture.issueId));
+      expect(links).toHaveLength(0);
     });
   });
 
