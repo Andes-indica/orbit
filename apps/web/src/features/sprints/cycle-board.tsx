@@ -6,10 +6,28 @@ import { rowHover } from '@/lib/interaction.ts';
 import { buildBurnUp, burnUpMetric } from './burn-up.ts';
 import type { AssigneeTally, CycleView, StateGroup } from './data.ts';
 
-function Tally({ label, value }: { readonly label: string; readonly value: number }) {
+function Tally({
+  label,
+  issues,
+  points,
+}: {
+  readonly label: string;
+  readonly issues: number;
+  readonly points: number | null;
+}) {
   return (
     <div className="flex flex-col">
-      <span className="font-medium text-lg text-text tabular">{value}</span>
+      <span className="font-medium text-lg text-text tabular">
+        {issues}
+        <span className="ml-1 font-normal text-2xs text-muted">
+          {issues === 1 ? 'task' : 'tasks'}
+        </span>
+      </span>
+      {points === null ? null : (
+        <span className="text-2xs text-muted tabular">
+          {points} {points === 1 ? 'point' : 'points'}
+        </span>
+      )}
       <span className="text-2xs text-faint uppercase">{label}</span>
     </div>
   );
@@ -139,9 +157,21 @@ export function CycleAnalytics({ cycle }: { readonly cycle: CycleView }) {
     <aside className="flex flex-col gap-5 rounded-lg border border-border p-4">
       <div className="flex flex-col gap-1.5">
         <div className="grid grid-cols-3 gap-2 text-center">
-          <Tally label="Scope" value={progress.scope} />
-          <Tally label="Started" value={progress.started} />
-          <Tally label="Completed" value={progress.completed} />
+          <Tally
+            label="Scope"
+            issues={progress.scope}
+            points={progress.estimated === 0 ? null : progress.points.scope}
+          />
+          <Tally
+            label="Started"
+            issues={progress.started}
+            points={progress.estimated === 0 ? null : progress.points.started}
+          />
+          <Tally
+            label="Completed"
+            issues={progress.completed}
+            points={progress.estimated === 0 ? null : progress.points.completed}
+          />
         </div>
         {progress.estimated === 0 ? null : (
           <p data-testid="sprint-points" className="text-center text-2xs text-muted tabular">
@@ -154,8 +184,11 @@ export function CycleAnalytics({ cycle }: { readonly cycle: CycleView }) {
             className="text-center text-2xs text-faint tabular"
             title="Issues in triage or backlog states sit in the sprint but count towards nothing until they move to Todo."
           >
-            {progress.uncommitted.issues} uncommitted, {progress.uncommitted.points} points not
-            counted
+            {progress.uncommitted.issues} {progress.uncommitted.issues === 1 ? 'task' : 'tasks'}{' '}
+            uncommitted
+            {progress.uncommitted.points === 0
+              ? ''
+              : `, ${progress.uncommitted.points} points not counted`}
           </p>
         )}
         <ScopeChanges progress={progress} />
@@ -188,6 +221,61 @@ export function CycleAnalytics({ cycle }: { readonly cycle: CycleView }) {
         )}
       </div>
     </aside>
+  );
+}
+
+export function CycleBoard({ cycle }: { readonly cycle: CycleView }) {
+  if (cycle.groups.length === 0) {
+    return <p className="text-faint text-xs">Nothing in this sprint yet.</p>;
+  }
+
+  return (
+    <div className="-mx-1 overflow-x-auto px-1 pb-2" data-testid="sprint-board">
+      <div className="flex items-start gap-3">
+        {cycle.groups.map((group) => (
+          <section
+            key={group.stateId}
+            data-testid={`sprint-column-${group.stateId}`}
+            className="flex w-72 shrink-0 flex-col gap-2 rounded-lg bg-subtle/40 p-2"
+          >
+            <header className="flex items-center gap-2 px-1">
+              <span
+                className="size-2 shrink-0 rounded-full"
+                style={{ backgroundColor: group.color }}
+                aria-hidden="true"
+              />
+              <h3 className="min-w-0 flex-1 truncate font-medium text-dense text-text">
+                {group.name}
+              </h3>
+              <span className="text-2xs text-faint tabular">{group.issues.length}</span>
+            </header>
+            <ul className="flex flex-col gap-1.5">
+              {group.issues.map((issue) => (
+                <li key={issue.id}>
+                  <Link
+                    href={`/issue/${issue.identifier}`}
+                    data-testid={`sprint-card-${issue.identifier}`}
+                    className={cn(
+                      'flex flex-col gap-1.5 rounded-md border border-border bg-surface p-2.5 outline-none',
+                      'focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset',
+                      rowHover,
+                    )}
+                  >
+                    <span className="line-clamp-2 text-dense text-text">{issue.title}</span>
+                    <span className="flex items-center gap-2">
+                      <span className="flex-1 text-2xs text-faint tabular">{issue.identifier}</span>
+                      {issue.assignee === null ? null : (
+                        <Avatar name={issue.assignee.name} src={issue.assignee.image} size="xs" />
+                      )}
+                    </span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ))}
+      </div>
+    </div>
   );
 }
 
