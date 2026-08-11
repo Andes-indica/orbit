@@ -1,25 +1,10 @@
-import { RefreshCcw } from 'lucide-react';
 import Link from 'next/link';
 import { Avatar } from '@/components/ui/avatar.tsx';
-import { Badge } from '@/components/ui/badge.tsx';
-import { EmptyState } from '@/components/ui/empty-state.tsx';
-import { ProgressBar } from '@/features/charts/donut.tsx';
 import { LineChart } from '@/features/charts/line-chart.tsx';
 import { cn } from '@/lib/cn.ts';
-import { cardHover, rowHover } from '@/lib/interaction.ts';
+import { rowHover } from '@/lib/interaction.ts';
 import { buildBurnUp, burnUpMetric } from './burn-up.ts';
-import type { CycleView, UpcomingCycleView } from './data.ts';
-import {
-  CompleteSprintButton,
-  DeleteSprintButton,
-  EditSprintButton,
-  NewSprintButton,
-  StartSprintButton,
-} from './sprint-actions.tsx';
-
-function formatDay(value: string): string {
-  return new Date(value).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
-}
+import type { AssigneeTally, CycleView, StateGroup } from './data.ts';
 
 function Tally({ label, value }: { readonly label: string; readonly value: number }) {
   return (
@@ -43,6 +28,97 @@ function ScopeChanges({ progress }: { readonly progress: CycleView['progress'] }
       {removed > 0 ? <span>{removed} removed</span> : null}
       {canceled > 0 ? <span>{canceled} cancelled</span> : null}
     </p>
+  );
+}
+
+function AssigneeTable({
+  groups,
+  assignees,
+}: {
+  readonly groups: readonly StateGroup[];
+  readonly assignees: readonly AssigneeTally[];
+}) {
+  const totals = groups.map((_, column) =>
+    assignees.reduce((sum, row) => sum + (row.points[column] ?? 0), 0),
+  );
+  const grand = totals.reduce((sum, value) => sum + value, 0);
+
+  return (
+    <div className="overflow-x-auto">
+      <table
+        className="w-full min-w-max border-collapse text-2xs tabular"
+        data-testid="assignee-points"
+      >
+        <thead>
+          <tr className="border-border border-b">
+            <th className="py-1 pr-2 text-left font-medium text-faint">Assignee</th>
+            {groups.map((group) => (
+              <th key={group.stateId} className="px-1 py-1 text-right font-medium text-faint">
+                <span className="flex items-center justify-end gap-1">
+                  <span
+                    className="size-1.5 shrink-0 rounded-full"
+                    style={{ backgroundColor: group.color }}
+                    aria-hidden="true"
+                  />
+                  {group.name}
+                </span>
+              </th>
+            ))}
+            <th className="py-1 pl-2 text-right font-medium text-text">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {assignees.map((assignee) => (
+            <tr key={assignee.id} className="border-border/60 border-b last:border-b-0">
+              <td className="py-1 pr-2">
+                <span className="flex items-center gap-1.5 text-muted">
+                  <Avatar name={assignee.name} src={assignee.image} size="xs" />
+                  <span className="truncate">{assignee.name}</span>
+                </span>
+              </td>
+              {groups.map((group, column) => {
+                const points = assignee.points[column] ?? 0;
+                return (
+                  <td
+                    key={group.stateId}
+                    data-testid={`assignee-${assignee.id}-${group.stateId}`}
+                    className={
+                      points === 0
+                        ? 'px-1 py-1 text-right text-faint'
+                        : 'px-1 py-1 text-right text-muted'
+                    }
+                  >
+                    {points}
+                  </td>
+                );
+              })}
+              <td
+                data-testid={`assignee-${assignee.id}-total`}
+                className="py-1 pl-2 text-right text-text"
+              >
+                {assignee.totalPoints}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr className="border-border border-t">
+            <td className="py-1 pr-2 text-faint">All</td>
+            {totals.map((points, column) => (
+              <td
+                key={groups[column]?.stateId ?? column}
+                className="px-1 py-1 text-right text-muted"
+              >
+                {points}
+              </td>
+            ))}
+            <td data-testid="assignee-grand-total" className="py-1 pl-2 text-right text-text">
+              {grand}
+            </td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
   );
 }
 
@@ -72,6 +148,16 @@ export function CycleAnalytics({ cycle }: { readonly cycle: CycleView }) {
             {progress.points.completed} of {progress.points.scope} points completed
           </p>
         )}
+        {progress.uncommitted.issues === 0 ? null : (
+          <p
+            data-testid="sprint-uncommitted"
+            className="text-center text-2xs text-faint tabular"
+            title="Issues in triage or backlog states sit in the sprint but count towards nothing until they move to Todo."
+          >
+            {progress.uncommitted.issues} uncommitted, {progress.uncommitted.points} points not
+            counted
+          </p>
+        )}
         <ScopeChanges progress={progress} />
       </div>
 
@@ -94,30 +180,11 @@ export function CycleAnalytics({ cycle }: { readonly cycle: CycleView }) {
       />
 
       <div className="flex flex-col gap-2.5">
-        <h3 className="font-medium text-dense text-text">Per assignee</h3>
+        <h3 className="font-medium text-dense text-text">Points per assignee</h3>
         {cycle.assignees.length === 0 ? (
           <p className="text-faint text-xs">Nothing assigned in this sprint.</p>
         ) : (
-          <ul className="flex flex-col gap-2.5">
-            {cycle.assignees.map((assignee) => (
-              <li key={assignee.id} className="flex flex-col gap-1">
-                <span className="flex items-center justify-between gap-2">
-                  <span className="flex items-center gap-1.5 text-muted text-xs">
-                    <Avatar name={assignee.name} src={assignee.image} size="xs" />
-                    {assignee.name}
-                  </span>
-                  <span className="text-2xs text-faint tabular">
-                    {assignee.completed}/{assignee.scope}
-                  </span>
-                </span>
-                <ProgressBar
-                  completed={assignee.completed}
-                  scope={assignee.scope}
-                  label={`${assignee.name} completion`}
-                />
-              </li>
-            ))}
-          </ul>
+          <AssigneeTable groups={cycle.groups} assignees={cycle.assignees} />
         )}
       </div>
     </aside>
@@ -173,88 +240,4 @@ export interface SprintTeam {
   readonly id: string;
   readonly key: string;
   readonly name: string;
-}
-
-export interface CyclePanelProps {
-  readonly cycle: CycleView | null;
-  readonly upcoming: readonly UpcomingCycleView[];
-  readonly team: SprintTeam;
-  readonly canManage: boolean;
-  readonly runningSprintId: string | null;
-}
-
-export function CyclePanel({ cycle, upcoming, team, canManage, runningSprintId }: CyclePanelProps) {
-  const open = cycle !== null && cycle.completedAt === null;
-
-  return (
-    <div className="flex flex-col gap-6">
-      {cycle === null ? (
-        <EmptyState
-          icon={<RefreshCcw strokeWidth={1.75} aria-hidden="true" />}
-          title="No active sprint"
-          description={`${team.name} has no sprint running right now.`}
-          action={canManage ? <NewSprintButton teamId={team.id} /> : null}
-        />
-      ) : (
-        <>
-          <header className="flex flex-wrap items-center gap-2">
-            <h2 className="font-semibold text-lg text-text">{cycle.name}</h2>
-            <Badge tone="accent">{cycle.teamKey}</Badge>
-            <span className="text-faint text-xs tabular">
-              {formatDay(cycle.startsAt)} to {formatDay(cycle.endsAt)}
-            </span>
-            {canManage && open ? (
-              <div className="ml-auto flex flex-wrap items-center gap-1.5">
-                <EditSprintButton sprint={cycle} />
-                <CompleteSprintButton sprint={cycle} />
-              </div>
-            ) : null}
-          </header>
-          <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
-            <CycleIssueList cycle={cycle} />
-            <CycleAnalytics cycle={cycle} />
-          </div>
-        </>
-      )}
-
-      <section className="flex flex-col gap-2">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className="font-medium text-dense text-text">Upcoming sprints</h3>
-          {canManage && cycle !== null ? <NewSprintButton teamId={team.id} /> : null}
-        </div>
-        {upcoming.length === 0 ? (
-          <p className="text-faint text-xs">Nothing scheduled after this one.</p>
-        ) : (
-          <ul className="flex flex-col gap-1.5">
-            {upcoming.map((entry) => (
-              <li
-                key={entry.id}
-                className={cn(
-                  'flex flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-1.5',
-                  cardHover,
-                )}
-              >
-                <span className="flex items-center gap-2 text-dense text-text">
-                  <Badge tone="outline">{entry.teamKey}</Badge>
-                  {entry.name}
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <span className="text-2xs text-faint tabular">
-                    {formatDay(entry.startsAt)} to {formatDay(entry.endsAt)}
-                  </span>
-                  {canManage ? (
-                    <>
-                      {runningSprintId === null ? <StartSprintButton sprint={entry} /> : null}
-                      <EditSprintButton sprint={entry} />
-                      <DeleteSprintButton sprint={entry} />
-                    </>
-                  ) : null}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-    </div>
-  );
 }
