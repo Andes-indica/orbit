@@ -5,10 +5,16 @@ import userEvent from '@testing-library/user-event';
 import { DocBody, docProseClassName } from '@/features/docs/doc-body.tsx';
 import {
   DIAGRAM_FAILED,
+  DIAGRAM_LABEL,
+  DIAGRAM_OPEN_EVENT,
   DIAGRAM_UNAVAILABLE,
+  type DiagramOpenDetail,
   drawDiagrams,
+  fitsTheColumn,
+  LEGIBLE_SCALE,
   type MermaidRenderer,
   mermaidConfig,
+  naturalWidth,
   SHOW_DIAGRAM_LABEL,
   SHOW_SOURCE_LABEL,
   safeSvg,
@@ -96,7 +102,7 @@ describe('a mermaid diagram in a doc', () => {
 
     await drawDiagrams(host, 'light', () => Promise.resolve(renderer));
 
-    const toggle = host.querySelector<HTMLButtonElement>('[data-mermaid-toggle]');
+    const toggle = host.querySelector<HTMLButtonElement>('[data-mermaid-view-toggle]');
     expect(toggle?.getAttribute('aria-label')).toBe(SHOW_SOURCE_LABEL);
     if (toggle === null) throw new Error('no toggle');
 
@@ -168,6 +174,50 @@ describe('the drawn markup', () => {
   });
 });
 
+describe('a diagram wider than the column', () => {
+  it('is scaled down only while it stays legible, and otherwise keeps its own size', () => {
+    expect(fitsTheColumn(600, 700)).toBe(true);
+    expect(fitsTheColumn(800, 700)).toBe(true);
+    expect(fitsTheColumn(3000, 700)).toBe(false);
+    expect(fitsTheColumn(700 / LEGIBLE_SCALE, 700)).toBe(true);
+    expect(fitsTheColumn(700 / LEGIBLE_SCALE + 1, 700)).toBe(false);
+  });
+
+  it('decides nothing before the page has laid the block out', () => {
+    expect(fitsTheColumn(0, 700)).toBe(false);
+    expect(fitsTheColumn(600, 0)).toBe(false);
+  });
+
+  it('asks mermaid for the diagram at its own size, never squeezed into the column', () => {
+    const styles = { getPropertyValue: () => '' } as unknown as CSSStyleDeclaration;
+    const config = mermaidConfig(styles, false);
+
+    expect(config.flowchart?.useMaxWidth).toBe(false);
+    expect(config.sequence?.useMaxWidth).toBe(false);
+    expect(config.gantt?.useMaxWidth).toBe(false);
+  });
+});
+
+describe('the width a diagram is measured at', () => {
+  function svgWith(attributes: Record<string, string>): SVGSVGElement {
+    const element = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    for (const [name, value] of Object.entries(attributes)) element.setAttribute(name, value);
+    return element as unknown as SVGSVGElement;
+  }
+
+  it('reads the size the diagram was drawn at, not the size css left it', () => {
+    expect(naturalWidth(svgWith({ width: '1600', viewBox: '0 0 1600 400' }))).toBe(1600);
+  });
+
+  it('falls back to the declared width when the view box is out of reach', () => {
+    expect(naturalWidth(svgWith({ width: '820' }))).toBe(820);
+  });
+
+  it('answers 0 when a diagram declares nothing, so no decision is taken on it', () => {
+    expect(naturalWidth(svgWith({}))).toBe(0);
+  });
+});
+
 describe('the diagram palette', () => {
   it('takes its colours from the theme tokens, so light and dark both look at home', () => {
     const styles = {
@@ -186,6 +236,22 @@ describe('the diagram palette', () => {
 });
 
 describe('the diagram chrome', () => {
+  it('offers a viewer for a diagram that outgrew the column', async () => {
+    const host = blockFrom(DIAGRAM);
+    const { renderer } = fakeMermaid(SVG);
+    const opened: DiagramOpenDetail[] = [];
+    host.addEventListener(DIAGRAM_OPEN_EVENT, (event) => {
+      opened.push((event as CustomEvent<DiagramOpenDetail>).detail);
+    });
+
+    await drawDiagrams(host, 'light', () => Promise.resolve(renderer));
+    host.querySelector<HTMLButtonElement>('[data-mermaid-expand]')?.click();
+
+    expect(opened).toHaveLength(1);
+    expect(opened[0]?.svg).toContain('graphics-hint');
+    expect(opened[0]?.label).toBe(DIAGRAM_LABEL);
+  });
+
   it('reveals the toggle on hover and keeps it visible while the source is showing', () => {
     expect(docProseClassName).toContain(
       '[&_[data-mermaid]:hover_[data-mermaid-toggle]]:opacity-100',
