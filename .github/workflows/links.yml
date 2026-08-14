@@ -1,0 +1,33 @@
+name: Check links
+
+on:
+  pull_request:
+    paths:
+      - '**/*.md'
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  links:
+    name: Check Markdown links
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check relative links (fail on error)
+        uses: lycheeverse/lychee-action@2c1f47c8b6b9d8e3f4a5b6c7d8e9f0a1b2c3d4e5
+        with:
+          args: --relative --exclude docs/assets/** --exclude node_modules/**
+
+      - name: Check external links (non-blocking)
+        uses: lycheeverse/lychee-action@2c1f47c8b6b9d8e3f4a5b6c7d8e9f0a1b2c3d4e5
+        with:
+          args: --exclude docs/assets/** --exclude node_modules/**
+        continue-on-error: true
