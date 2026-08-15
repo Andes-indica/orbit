@@ -113,6 +113,7 @@ function renderInbox(items: readonly InboxItem[], nextCursor: string | null) {
           items={items}
           unreadCount={0}
           unreadMentions={0}
+          unreadActivity={0}
           userId="user_1"
           nextCursor={nextCursor}
           canWriteDocs
@@ -257,13 +258,13 @@ describe('an inbox with more notifications than one page', () => {
     });
   });
 
-  it('says inbox zero only when there is nothing left to fetch', async () => {
+  it('shows the empty state only when there is nothing left to fetch', async () => {
     const user = userEvent.setup();
     renderInbox([item('n1', { read: true })], null);
 
     await user.click(screen.getByRole('button', { name: 'Unread' }));
 
-    expect(screen.getByText('Inbox zero')).toBeInTheDocument();
+    expect(screen.getByText('Nothing on this tab')).toBeInTheDocument();
     expect(screen.queryByTestId('inbox-load-more')).toBeNull();
   });
 

@@ -2,7 +2,11 @@
 
 import { useDeltaHandler, useScopeSubscription } from '@orbit/realtime-client/react';
 import type { NotificationType } from '@orbit/shared/constants';
-import { isPullRequestNotification, NOTIFICATION_TYPES } from '@orbit/shared/constants';
+import {
+  isPullRequestNotification,
+  isStatusChangeNotification,
+  NOTIFICATION_TYPES,
+} from '@orbit/shared/constants';
 import type { SyncAction } from '@orbit/shared/events';
 import { scopes } from '@orbit/shared/events';
 import { relativeTime } from '@orbit/shared/utils';
@@ -35,7 +39,7 @@ import { DocSurface } from '@/features/docs/doc-surface.tsx';
 import { IssueDetailView } from '@/features/issues/issue-detail.tsx';
 import { apiRequest } from '@/lib/api/client.ts';
 import { cn } from '@/lib/cn.ts';
-import { rowHover } from '@/lib/interaction.ts';
+import { rowHover, tabHover } from '@/lib/interaction.ts';
 import { useHotkey } from '@/lib/keyboard/index.ts';
 import { clientId } from '@/lib/query/client-id.ts';
 import type { InboxItem } from './data.ts';
@@ -69,18 +73,27 @@ const SOURCE_ICONS: Record<NotificationType, LucideIcon> = {
 };
 
 const TABS = [
-  { id: 'all', label: 'All' },
+  { id: 'activity', label: 'Activity' },
   { id: 'unread', label: 'Unread' },
   { id: 'mentions', label: 'Mentions' },
   { id: 'pulls', label: 'Pull requests' },
+  { id: 'status', label: 'Status' },
 ] as const;
 type TabId = (typeof TABS)[number]['id'];
 
 function matchesTab(item: InboxItem, tab: TabId): boolean {
-  if (tab === 'unread') return !item.read;
-  if (tab === 'mentions') return item.type === 'mention';
-  if (tab === 'pulls') return isPullRequestNotification(item.type);
-  return true;
+  switch (tab) {
+    case 'activity':
+      return isActivity(item);
+    case 'status':
+      return isStatusChangeNotification(item.type);
+    case 'unread':
+      return !item.read;
+    case 'mentions':
+      return item.type === 'mention';
+    case 'pulls':
+      return isPullRequestNotification(item.type);
+  }
 }
 
 function openLabel(item: InboxItem): string {
@@ -89,6 +102,8 @@ function openLabel(item: InboxItem): string {
 }
 
 const SNOOZE_HOURS = 24;
+
+const FAILED_SAVE = 'That did not save. Check your connection and try again.';
 
 const notificationDeltaSchema = z.object({
   id: z.string(),
@@ -158,14 +173,46 @@ interface InboxPatch {
   readonly rows: readonly InboxItem[];
   readonly unreadDelta: number;
   readonly mentionDelta: number;
+  readonly activityDelta: number;
 }
 
 function readChange(read: boolean): number {
   return read ? -1 : 1;
 }
 
+function isActivity(item: InboxItem): boolean {
+  return !isStatusChangeNotification(item.type);
+}
+
+function countsTowardUnread(item: InboxItem, at = Date.now()): boolean {
+  return item.snoozedUntil === null || Date.parse(item.snoozedUntil) <= at;
+}
+
 function unreadMentionCount(item: InboxItem): number {
-  return !item.read && item.type === 'mention' ? 1 : 0;
+  return !item.read && countsTowardUnread(item) && item.type === 'mention' ? 1 : 0;
+}
+
+function unreadActivityCount(item: InboxItem): number {
+  return !item.read && countsTowardUnread(item) && isActivity(item) ? 1 : 0;
+}
+
+export interface SnoozeRollback {
+  readonly rows: readonly InboxItem[];
+  readonly restoreCounts: boolean;
+}
+
+export function snoozeRollback(
+  rows: readonly InboxItem[],
+  id: string,
+  optimistic: string,
+  previous: string | null,
+): SnoozeRollback {
+  const ours = rows.some((row) => row.id === id && row.snoozedUntil === optimistic);
+  if (!ours) return { rows, restoreCounts: false };
+  return {
+    rows: rows.map((row) => (row.id === id ? { ...row, snoozedUntil: previous } : row)),
+    restoreCounts: true,
+  };
 }
 
 function applyOne(patch: InboxPatch, action: SyncAction): InboxPatch {
@@ -179,6 +226,7 @@ function applyOne(patch: InboxPatch, action: SyncAction): InboxPatch {
       rows: patch.rows.filter((row) => row.id !== item.id),
       unreadDelta: patch.unreadDelta - (previous.read ? 0 : 1),
       mentionDelta: patch.mentionDelta - unreadMentionCount(previous),
+      activityDelta: patch.activityDelta - unreadActivityCount(previous),
     };
   }
   if (previous === undefined) {
@@ -187,6 +235,7 @@ function applyOne(patch: InboxPatch, action: SyncAction): InboxPatch {
       rows: [item, ...patch.rows],
       unreadDelta: patch.unreadDelta + (item.read ? 0 : 1),
       mentionDelta: patch.mentionDelta + unreadMentionCount(item),
+      activityDelta: patch.activityDelta + unreadActivityCount(item),
     };
   }
   const change = previous.read === item.read ? 0 : readChange(item.read);
@@ -194,6 +243,8 @@ function applyOne(patch: InboxPatch, action: SyncAction): InboxPatch {
     rows: patch.rows.map((row) => (row.id === item.id ? item : row)),
     unreadDelta: patch.unreadDelta + change,
     mentionDelta: patch.mentionDelta + (unreadMentionCount(item) - unreadMentionCount(previous)),
+    activityDelta:
+      patch.activityDelta + (unreadActivityCount(item) - unreadActivityCount(previous)),
   };
 }
 
@@ -204,7 +255,7 @@ export function applyNotificationDeltas(
 ): InboxPatch {
   return actions
     .filter((action) => action.model === 'notification' && action.originClientId !== tabClientId)
-    .reduce(applyOne, { rows, unreadDelta: 0, mentionDelta: 0 });
+    .reduce(applyOne, { rows, unreadDelta: 0, mentionDelta: 0, activityDelta: 0 });
 }
 
 function LoadMoreRow({
@@ -417,6 +468,7 @@ export interface InboxViewProps {
   readonly items: readonly InboxItem[];
   readonly unreadCount: number;
   readonly unreadMentions: number;
+  readonly unreadActivity: number;
   readonly nextCursor: string | null;
   readonly userId: string;
   readonly canWriteDocs: boolean;
@@ -427,20 +479,25 @@ export function InboxView({
   items,
   unreadCount,
   unreadMentions,
+  unreadActivity,
   nextCursor,
   userId,
   canWriteDocs,
   canPublishDocs,
 }: InboxViewProps) {
   const [rows, setRows] = useState<readonly InboxItem[]>(items);
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  const snoozing = useRef<Set<string>>(new Set());
   const [unread, setUnread] = useState(unreadCount);
   const [mentions, setMentions] = useState(unreadMentions);
+  const [activity, setActivity] = useState(unreadActivity);
   const [cursor, setCursor] = useState<string | null>(nextCursor);
   const [loadingMore, setLoadingMore] = useState(false);
   const [pagingError, setPagingError] = useState<string | null>(null);
   const inFlight = useRef(false);
   const cursorRef = useRef<string | null>(nextCursor);
-  const [tab, setTab] = useState<TabId>('all');
+  const [tab, setTab] = useState<TabId>('activity');
   const [retainedUnreadIds, setRetainedUnreadIds] = useState<ReadonlySet<string>>(new Set());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -449,9 +506,10 @@ export function InboxView({
     setRows(items);
     setUnread(unreadCount);
     setMentions(unreadMentions);
+    setActivity(unreadActivity);
     setCursor(nextCursor);
     cursorRef.current = nextCursor;
-  }, [items, unreadCount, unreadMentions, nextCursor]);
+  }, [items, unreadCount, unreadMentions, unreadActivity, nextCursor]);
 
   useScopeSubscription([scopes.user(userId)]);
   useDeltaHandler(
@@ -464,6 +522,9 @@ export function InboxView({
         }
         if (patch.mentionDelta !== 0) {
           setMentions((current) => Math.max(0, current + patch.mentionDelta));
+        }
+        if (patch.activityDelta !== 0) {
+          setActivity((current) => Math.max(0, current + patch.activityDelta));
         }
       },
       [rows],
@@ -549,7 +610,9 @@ export function InboxView({
   const setReadState = useCallback(
     async (item: InboxItem, next: boolean) => {
       if (item.read === next) return;
-      const isMention = item.type === 'mention';
+      const counted = countsTowardUnread(item);
+      const isMention = counted && item.type === 'mention';
+      const countsAsActivity = counted && isActivity(item);
       const applyLocally = (read: boolean, step: number) => {
         setRows((list) => list.map((row) => (row.id === item.id ? { ...row, read } : row)));
         if (tab === 'unread') {
@@ -561,6 +624,7 @@ export function InboxView({
           });
         }
         if (isMention) setMentions((count) => Math.max(0, count + step));
+        if (countsAsActivity) setActivity((count) => Math.max(0, count + step));
         setUnread((count) => Math.max(0, count + step));
       };
 
@@ -574,7 +638,7 @@ export function InboxView({
         );
       } catch (cause) {
         applyLocally(item.read, next ? 1 : -1);
-        setError('That did not save. Check your connection and try again.');
+        setError(FAILED_SAVE);
         throw cause;
       }
     },
@@ -594,25 +658,66 @@ export function InboxView({
     [setReadState],
   );
 
+  const restoreCounts = useCallback((mention: boolean, activityRow: boolean) => {
+    if (mention) setMentions((count) => count + 1);
+    if (activityRow) setActivity((count) => count + 1);
+  }, []);
+
   const snooze = useCallback(async () => {
-    if (current === undefined) return;
+    if (current === undefined || snoozing.current.has(current.id)) return;
+    snoozing.current.add(current.id);
     const snoozedUntil = new Date(Date.now() + SNOOZE_HOURS * 3_600_000).toISOString();
+    const previousSnoozedUntil = current.snoozedUntil;
+    const wasUnreadMention = unreadMentionCount(current) === 1;
+    const wasUnreadActivity = unreadActivityCount(current) === 1;
     setRows((list) => list.map((row) => (row.id === current.id ? { ...row, snoozedUntil } : row)));
-    applyServerCount(
-      await apiRequest(`/api/notifications/${current.id}`, {
-        method: 'PATCH',
-        body: { snoozeHours: SNOOZE_HOURS },
-      }),
-    );
-  }, [current, applyServerCount]);
+    if (wasUnreadMention) setMentions((count) => Math.max(0, count - 1));
+    if (wasUnreadActivity) setActivity((count) => Math.max(0, count - 1));
+    try {
+      applyServerCount(
+        await apiRequest(`/api/notifications/${current.id}`, {
+          method: 'PATCH',
+          body: { snoozeHours: SNOOZE_HOURS },
+        }),
+      );
+    } catch {
+      const rollback = snoozeRollback(
+        rowsRef.current,
+        current.id,
+        snoozedUntil,
+        previousSnoozedUntil,
+      );
+      setRows(rollback.rows);
+      if (rollback.restoreCounts) restoreCounts(wasUnreadMention, wasUnreadActivity);
+      setError(FAILED_SAVE);
+    } finally {
+      snoozing.current.delete(current.id);
+    }
+  }, [current, applyServerCount, restoreCounts]);
 
   const remove = useCallback(async () => {
     if (current === undefined) return;
-    const wasUnreadMention = !current.read && current.type === 'mention';
+    const wasUnreadMention = unreadMentionCount(current) === 1;
+    const wasUnreadActivity = unreadActivityCount(current) === 1;
+    const removedAt = rows.findIndex((row) => row.id === current.id);
     setRows((list) => list.filter((row) => row.id !== current.id));
     if (wasUnreadMention) setMentions((count) => Math.max(0, count - 1));
-    applyServerCount(await apiRequest(`/api/notifications/${current.id}`, { method: 'DELETE' }));
-  }, [current, applyServerCount]);
+    if (wasUnreadActivity) setActivity((count) => Math.max(0, count - 1));
+    try {
+      applyServerCount(await apiRequest(`/api/notifications/${current.id}`, { method: 'DELETE' }));
+    } catch {
+      const stillRemoved = !rowsRef.current.some((row) => row.id === current.id);
+      if (stillRemoved) {
+        setRows((list) => {
+          const restored = [...list];
+          restored.splice(removedAt === -1 ? list.length : removedAt, 0, current);
+          return restored;
+        });
+        restoreCounts(wasUnreadMention, wasUnreadActivity);
+      }
+      setError(FAILED_SAVE);
+    }
+  }, [current, rows, applyServerCount, restoreCounts]);
 
   useHotkey('j', () => move(1), {
     label: 'Next notification',
@@ -673,16 +778,25 @@ export function InboxView({
               <button
                 key={entry.id}
                 type="button"
+                data-testid={`inbox-tab-${entry.id}`}
                 onClick={() => selectTab(entry.id)}
                 aria-current={tab === entry.id ? 'true' : undefined}
                 className={cn(
-                  'rounded-md px-2.5 py-1 text-dense transition-colors duration-[var(--duration-fast)]',
+                  'flex items-center gap-1.5 rounded-md px-2.5 py-1 text-dense',
                   tab === entry.id
                     ? 'bg-accent-soft font-medium text-accent'
-                    : 'text-muted hover:bg-surface-2 hover:text-text',
+                    : cn(tabHover, 'text-muted hover:bg-surface-2'),
                 )}
               >
                 {entry.label}
+                {entry.id === 'activity' && activity > 0 ? (
+                  <span
+                    data-testid="inbox-activity-count"
+                    className="text-2xs text-faint tabular-nums"
+                  >
+                    {activity}
+                  </span>
+                ) : null}
               </button>
             ))}
           </nav>
@@ -699,8 +813,12 @@ export function InboxView({
       {visible.length === 0 && cursor === null ? (
         <EmptyState
           icon={<Bell strokeWidth={1.75} aria-hidden="true" />}
-          title="Inbox zero"
-          description="When somebody assigns you an issue, mentions you, replies to you, or changes something you follow, it lands here. Your own actions do not."
+          title={rows.length === 0 ? 'Inbox zero' : 'Nothing on this tab'}
+          description={
+            rows.length === 0
+              ? 'When somebody assigns you an issue, mentions you, replies to you, or changes something you follow, it lands here. Your own actions do not.'
+              : 'Every notification you have is on another tab. Status collects the issue field moves, and Unread, Mentions and Pull requests span all of them.'
+          }
           className="flex-1"
         />
       ) : (
