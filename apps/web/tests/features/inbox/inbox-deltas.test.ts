@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 import type { SyncAction } from '@orbit/shared/events';
 import type { InboxItem } from '../../../src/features/inbox/data.ts';
-import { applyNotificationDeltas } from '../../../src/features/inbox/inbox-view.tsx';
+import {
+  applyNotificationDeltas,
+  snoozeRollback,
+} from '../../../src/features/inbox/inbox-view.tsx';
 
 const TAB = 'tab_a';
 
@@ -47,6 +50,11 @@ function action(overrides: Partial<SyncAction> = {}): SyncAction {
     at: '2026-01-01T00:00:00.000Z',
     ...overrides,
   };
+}
+
+function comment(overrides: Partial<SyncAction> = {}): SyncAction {
+  const base = action(overrides);
+  return { ...base, data: { ...base.data, type: 'comment_created' } };
 }
 
 function read(base: SyncAction): SyncAction {
@@ -150,6 +158,46 @@ describe('applyNotificationDeltas', () => {
     const patch = applyNotificationDeltas([item({ type: 'mention' })], [read(action())], TAB);
     expect(patch.mentionDelta).toBe(-1);
   });
+
+  it('leaves the activity count alone when an assignment arrives', () => {
+    const patch = applyNotificationDeltas([], [action()], TAB);
+    expect(patch.unreadDelta).toBe(1);
+    expect(patch.activityDelta).toBe(0);
+  });
+
+  it('raises the activity count when an unread comment arrives', () => {
+    const patch = applyNotificationDeltas([], [comment()], TAB);
+    expect(patch.unreadDelta).toBe(1);
+    expect(patch.activityDelta).toBe(1);
+  });
+
+  it('lowers the activity count when another tab reads a comment', () => {
+    const patch = applyNotificationDeltas(
+      [item({ type: 'comment_created' })],
+      [read(comment())],
+      TAB,
+    );
+    expect(patch.activityDelta).toBe(-1);
+  });
+
+  it('lowers the activity count when an unread comment is deleted', () => {
+    const patch = applyNotificationDeltas(
+      [item({ type: 'comment_created' })],
+      [comment({ action: 'delete' })],
+      TAB,
+    );
+    expect(patch.activityDelta).toBe(-1);
+  });
+
+  it('leaves the activity count alone when a status change is deleted', () => {
+    const patch = applyNotificationDeltas(
+      [item({ type: 'issue_status_changed' })],
+      [action({ action: 'delete' })],
+      TAB,
+    );
+    expect(patch.unreadDelta).toBe(-1);
+    expect(patch.activityDelta).toBe(0);
+  });
 });
 
 describe('what the reading pane is looking at', () => {
@@ -198,5 +246,63 @@ describe('what the reading pane is looking at', () => {
     const row = item({ entityType: 'issue', entityId: 'issue_42' });
     expect(row.entityType).toBe('issue');
     expect(row.entityId).toBe('issue_42');
+  });
+});
+
+describe('rolling back a snooze the server rejected', () => {
+  it('puts back the value the row had before the failed request', () => {
+    const rows = [item({ snoozedUntil: '2026-03-01T00:00:00.000Z' })];
+
+    const rollback = snoozeRollback(rows, 'notification_1', '2026-03-01T00:00:00.000Z', null);
+
+    expect(rollback.rows[0]?.snoozedUntil).toBeNull();
+    expect(rollback.restoreCounts).toBe(true);
+  });
+
+  it('leaves a newer snooze alone rather than overwriting it', () => {
+    const rows = [item({ snoozedUntil: '2026-06-01T00:00:00.000Z' })];
+
+    const rollback = snoozeRollback(rows, 'notification_1', '2026-03-01T00:00:00.000Z', null);
+
+    expect(rollback.rows[0]?.snoozedUntil).toBe('2026-06-01T00:00:00.000Z');
+  });
+
+  it('leaves the counts alone when it did not undo the snooze', () => {
+    const rows = [item({ snoozedUntil: '2026-06-01T00:00:00.000Z' })];
+
+    const rollback = snoozeRollback(rows, 'notification_1', '2026-03-01T00:00:00.000Z', null);
+
+    expect(rollback.restoreCounts).toBe(false);
+  });
+
+  it('leaves every other row untouched', () => {
+    const rows = [
+      item({ id: 'notification_1', snoozedUntil: '2026-03-01T00:00:00.000Z' }),
+      item({ id: 'notification_2', snoozedUntil: '2026-03-01T00:00:00.000Z' }),
+    ];
+
+    const rollback = snoozeRollback(rows, 'notification_1', '2026-03-01T00:00:00.000Z', null);
+
+    expect(rollback.rows[1]?.snoozedUntil).toBe('2026-03-01T00:00:00.000Z');
+  });
+});
+
+describe('a snoozed mention', () => {
+  it('is not counted, because the server counter excludes it too', () => {
+    const patch = applyNotificationDeltas(
+      [item({ type: 'mention', snoozedUntil: '2999-01-01T00:00:00.000Z' })],
+      [action({ action: 'delete' })],
+      TAB,
+    );
+    expect(patch.mentionDelta).toBe(0);
+  });
+
+  it('is counted again once the snooze has expired', () => {
+    const patch = applyNotificationDeltas(
+      [item({ type: 'mention', snoozedUntil: '2020-01-01T00:00:00.000Z' })],
+      [action({ action: 'delete' })],
+      TAB,
+    );
+    expect(patch.mentionDelta).toBe(-1);
   });
 });

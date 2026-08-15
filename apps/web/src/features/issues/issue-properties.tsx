@@ -14,6 +14,7 @@ import type { Cycle, Issue, Milestone, Project } from '@/lib/query/schemas.ts';
 import { useUpdateIssue } from '@/lib/query/use-issues.ts';
 import { useMilestones } from '@/lib/query/use-milestones.ts';
 import { DueDateField } from './due-date-field.tsx';
+import { EstimateGlyph, estimateLabel } from './estimate-glyph.tsx';
 import { useIssueDeletion } from './issue-deletion.tsx';
 import { IssuePicker } from './issue-picker.tsx';
 import { PriorityGlyph, priorityLabel } from './priority-glyph.tsx';
@@ -135,9 +136,11 @@ export function IssueProperties({ issue, parent = null, onDeleted }: IssueProper
           testId="menu-status"
         >
           <button type="button" className={rowClassName} data-testid="property-status">
-            {state === undefined ? null : (
-              <StateGlyph category={state.category} color={state.color} />
-            )}
+            <span aria-hidden="true" className="flex items-center">
+              {state === undefined ? null : (
+                <StateGlyph category={state.category} color={state.color} />
+              )}
+            </span>
             {state?.name ?? 'Unknown'}
           </button>
         </PropertyMenu>
@@ -157,7 +160,9 @@ export function IssueProperties({ issue, parent = null, onDeleted }: IssueProper
           onSelect={(value) => patch({ priority: Number(value) })}
         >
           <button type="button" className={rowClassName} data-testid="property-priority">
-            <PriorityGlyph priority={issue.priority} />
+            <span aria-hidden="true" className="flex items-center">
+              <PriorityGlyph priority={issue.priority} />
+            </span>
             {priorityLabel(issue.priority)}
           </button>
         </PropertyMenu>
@@ -180,11 +185,13 @@ export function IssueProperties({ issue, parent = null, onDeleted }: IssueProper
           onSelect={(value) => patch({ assigneeId: value === 'none' ? null : value })}
         >
           <button type="button" className={rowClassName} data-testid="property-assignee">
-            {assignee === undefined ? (
-              <span className="size-4.5 rounded-full border border-border border-dashed" />
-            ) : (
-              <Avatar name={assignee.name} src={assignee.image} size="xs" />
-            )}
+            <span aria-hidden="true" className="flex items-center">
+              {assignee === undefined ? (
+                <span className="size-4.5 rounded-full border border-border border-dashed" />
+              ) : (
+                <Avatar name={assignee.name} src={assignee.image} size="xs" />
+              )}
+            </span>
             {assignee?.name ?? 'Unassigned'}
           </button>
         </PropertyMenu>
@@ -196,17 +203,22 @@ export function IssueProperties({ issue, parent = null, onDeleted }: IssueProper
           open={openMenu === 'estimate'}
           onOpenChange={toggle('estimate')}
           options={[
-            { id: 'none', label: 'No estimate' },
+            { id: 'none', label: estimateLabel(null), icon: <EstimateGlyph points={null} /> },
             ...DEFAULT_ESTIMATE_SCALE.map((points) => ({
               id: String(points),
-              label: `${points} points`,
+              label: estimateLabel(points),
+              icon: <EstimateGlyph points={points} />,
             })),
           ]}
           selected={issue.estimate === null ? ['none'] : [String(issue.estimate)]}
           onSelect={(value) => patch({ estimate: value === 'none' ? null : Number(value) })}
+          testId="menu-estimate"
         >
           <button type="button" className={rowClassName} data-testid="property-estimate">
-            {issue.estimate === null ? 'No estimate' : `${issue.estimate} points`}
+            <span aria-hidden="true" className="flex items-center">
+              <EstimateGlyph points={issue.estimate} />
+            </span>
+            {estimateLabel(issue.estimate)}
           </button>
         </PropertyMenu>
       </PropertyRow>

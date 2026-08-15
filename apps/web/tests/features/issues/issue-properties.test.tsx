@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { DEFAULT_ESTIMATE_SCALE } from '@orbit/shared/constants';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactNode } from 'react';
 import { resolvedHotkeys } from '@/components/shortcuts-overlay.tsx';
 import { ToastProvider } from '@/components/ui/toast.tsx';
+import { estimateLabel } from '@/features/issues/estimate-glyph.tsx';
 import type { WorkspaceData } from '@/features/issues/workspace-provider.tsx';
 import * as workspaceProvider from '@/features/issues/workspace-provider.tsx';
 import { HotkeyProvider, useHotkeyList } from '@/lib/keyboard/index.ts';
@@ -403,5 +405,92 @@ describe('reaching what the properties panel names', () => {
 
     expect(screen.queryByTestId('open-project')).not.toBeInTheDocument();
     expect(screen.queryByTestId('open-sprint')).not.toBeInTheDocument();
+  });
+});
+
+describe('the estimate row on the issue properties panel', () => {
+  it('carries a glyph beside the reading, so estimate matches every other property', () => {
+    mountProperties(issue({ estimate: 3 }));
+
+    const row = screen.getByTestId('property-estimate');
+    expect(row).toHaveTextContent('3 points');
+    expect(within(row).getByLabelText('3 points').tagName.toLowerCase()).toBe('svg');
+  });
+
+  it('shows an empty glyph and no reading when the issue has no estimate', () => {
+    mountProperties(issue());
+
+    const row = screen.getByTestId('property-estimate');
+    expect(row).toHaveTextContent('No estimate');
+    expect(within(row).getByLabelText('No estimate')).toBeInTheDocument();
+  });
+
+  it('says one point rather than 1 points', () => {
+    mountProperties(issue({ estimate: 1 }));
+
+    expect(screen.getByTestId('property-estimate')).toHaveTextContent(/^1 point$/);
+  });
+
+  it('announces the row once, not twice, because the glyph repeats the reading', () => {
+    mountProperties(issue({ estimate: 3 }));
+
+    expect(screen.getByRole('button', { name: '3 points' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '3 points 3 points' })).toBeNull();
+  });
+
+  it('names every glyph bearing row in the panel after its visible text alone', () => {
+    mountProperties(issue({ estimate: 3, priority: 1 }));
+
+    for (const row of ['property-status', 'property-priority', 'property-estimate']) {
+      const button = screen.getByTestId(row);
+      expect(button).toHaveAccessibleName((button.textContent ?? '').trim());
+    }
+  });
+
+  it('offers every step of the scale with its own glyph', async () => {
+    const user = userEvent.setup();
+    mountProperties(issue());
+
+    await user.click(screen.getByTestId('property-estimate'));
+    const menu = await screen.findByTestId('menu-estimate');
+
+    for (const points of DEFAULT_ESTIMATE_SCALE) {
+      const option = within(menu).getByText(estimateLabel(points)).parentElement;
+      expect(option?.querySelector('svg')).not.toBeNull();
+    }
+  });
+
+  it('leaves a menu option named once, with the glyph hidden behind the label', async () => {
+    const user = userEvent.setup();
+    mountProperties(issue());
+
+    await user.click(screen.getByTestId('property-estimate'));
+    const menu = await screen.findByTestId('menu-estimate');
+
+    const option = within(menu).getByText('5 points').parentElement;
+    expect(option?.querySelector('[aria-hidden="true"] svg')).not.toBeNull();
+    expect(within(menu).getByRole('menuitemradio', { name: '5 points' })).toBeInTheDocument();
+  });
+
+  it('sets the estimate the user picks', async () => {
+    const user = userEvent.setup();
+    mountProperties(issue());
+
+    await user.click(screen.getByTestId('property-estimate'));
+    const menu = await screen.findByTestId('menu-estimate');
+    await user.click(within(menu).getByText('8 points'));
+
+    await waitFor(() => expect(patches).toEqual([{ estimate: 8 }]));
+  });
+
+  it('clears the estimate when the user picks none', async () => {
+    const user = userEvent.setup();
+    mountProperties(issue({ estimate: 5 }));
+
+    await user.click(screen.getByTestId('property-estimate'));
+    const menu = await screen.findByTestId('menu-estimate');
+    await user.click(within(menu).getByText('No estimate'));
+
+    await waitFor(() => expect(patches).toEqual([{ estimate: null }]));
   });
 });
