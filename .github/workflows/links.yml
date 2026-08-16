@@ -1,0 +1,44 @@
+name: Check links
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  links:
+    name: Check Markdown links
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Check relative links (fail on error)
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8
+        with:
+          args: >-
+            --offline "**/*.md" --exclude-path "(^|/)node_modules/|^docs/assets/"
+
+      - name: Check external links (non-blocking)
+        id: external
+        if: ${{ !cancelled() }}
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8
+        with:
+          args: >-
+            "**/*.md" --exclude-path "(^|/)node_modules/|^docs/assets/" --exclude-all-private --exclude 'github\.com/[^/]+/[^/]+/stargazers'
+          fail: false
+
+      - name: The external check itself must not be broken
+        if: ${{ !cancelled() }}
+        run: |
+          code="${{ steps.external.outputs.exit_code }}"
+          if [ "$code" != "0" ] && [ "$code" != "2" ]; then
+            echo "lychee exited $code, a runtime or configuration failure rather than link rot"
+            exit 1
+          fi
