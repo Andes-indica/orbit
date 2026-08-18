@@ -113,8 +113,10 @@ jobs:
           with open('RELEASE_NOTES.md','w') as f:
             f.write(body)
           print('WROTE RELEASE_NOTES.md')
-          print('::set-output name=notes_path::RELEASE_NOTES.md')
+          # write output using the environment file instead of deprecated set-output
+          # the step runner will append this to $GITHUB_OUTPUT
           PY
+          echo "notes_path=RELEASE_NOTES.md" >> "$GITHUB_OUTPUT"
 
       - name: Create dated tag
         id: create_tag
@@ -133,6 +135,8 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG=${{ steps.create_tag.outputs.tag }}
