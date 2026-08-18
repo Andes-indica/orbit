@@ -90,8 +90,7 @@ jobs:
             area = next((l for l in labels if l.startswith('area:')), 'Other')
             areas.setdefault(area, []).append(p)
 
-          body = f"Automated release for {os.environ.get('GITHUB_SHA','')}
-\n"
+          body = f"Automated release for {os.environ.get('GITHUB_SHA','')}\\n"
           if breaking:
             body += '## Breaking changes\n'
             for pr in breaking:
