@@ -39,7 +39,7 @@ jobs:
         id: build_notes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          since_date: ${{ steps.since.outputs.since_date }}
+          
         run: |
           set -euo pipefail
           bun ./scripts/release-notes.ts

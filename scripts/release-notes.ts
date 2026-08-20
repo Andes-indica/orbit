@@ -9,13 +9,13 @@ type PullRequest = {
   body?: string | null;
   labels?: Label[];
   merged_at?: string | null;
+  updated_at: string;
 };
 
 const repo = process.env['GITHUB_REPOSITORY'];
 const token = process.env['GITHUB_TOKEN'];
-const sinceEnv =
-  process.env['since_date'] || process.env['INPUT_SINCE'] || process.env['GITHUB_SINCE'];
-const _githubSha = process.env['GITHUB_SHA'] || '';
+
+const githubSha = process.env['GITHUB_SHA'] || '';
 
 if (!repo) {
   console.error('GITHUB_REPOSITORY is not set');
@@ -23,7 +23,28 @@ if (!repo) {
   throw new Error('GITHUB_REPOSITORY is not set');
 }
 
-const since = sinceEnv || new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+async function getSinceDate(): Promise<string> {
+  const lastTag = await getLastTag();
+
+  if (!lastTag) {
+    return new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+  }
+
+  const proc = Bun.spawn(['git', 'log', '-1', '--format=%cI', lastTag], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+
+  const output = await new Response(proc.stdout).text();
+  const error = await new Response(proc.stderr).text();
+  const exitCode = await proc.exited;
+
+  if (exitCode !== 0 || !output.trim()) {
+    throw new Error(`Failed to determine date for tag ${lastTag}: ${error.trim()}`);
+  }
+
+  return output.trim();
+}
 const [owner, repoName] = repo.split('/');
 
 const headers: Record<string, string> = {
@@ -40,6 +61,25 @@ async function fetchJson(url: string): Promise<unknown> {
   }
   return JSON.parse(text);
 }
+async function getLastTag(): Promise<string | null> {
+  const proc = Bun.spawn(['git', 'describe', '--tags', '--abbrev=0'], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+
+  const output = await new Response(proc.stdout).text();
+  const error = await new Response(proc.stderr).text();
+  const exitCode = await proc.exited;
+
+  if (exitCode !== 0) {
+    if (error.trim()) {
+      console.warn(`Could not determine last tag: ${error.trim()}`);
+    }
+    return null;
+  }
+
+  return output.trim() || null;
+}
 
 async function fetchPageOfPRs(page: number): Promise<PullRequest[]> {
   const url = `https://api.github.com/repos/${owner}/${repoName}/pulls?state=closed&per_page=100&sort=updated&direction=desc&page=${page}`;
@@ -48,17 +88,20 @@ async function fetchPageOfPRs(page: number): Promise<PullRequest[]> {
   return data as PullRequest[];
 }
 
-async function collectMergedPRs(): Promise<PullRequest[]> {
+async function collectMergedPRs(since: string): Promise<PullRequest[]> {
   const merged: PullRequest[] = [];
   const sinceDate = new Date(since);
   for (let page = 1; ; page++) {
     const pagePRs = await fetchPageOfPRs(page);
     if (pagePRs.length === 0) break;
     for (const p of pagePRs) {
+      if (new Date(p.updated_at) < sinceDate) return merged;
+
       if (!p.merged_at) continue;
-      const mergedAt = new Date(p.merged_at);
-      if (mergedAt < sinceDate) return merged;
-      merged.push(p);
+
+      if (new Date(p.merged_at) >= sinceDate) {
+        merged.push(p);
+      }
     }
     if (pagePRs.length < 100) break;
   }
@@ -86,7 +129,7 @@ function groupByArea(prs: PullRequest[]) {
 
 function renderNotes(prs: PullRequest[]): string {
   const { areas, breaking } = groupByArea(prs);
-  let body = `Automated release for ${_githubSha}\n\n`;
+  let body = `Automated release for ${githubSha}\n\n`;
 
   if (breaking.length) {
     body += '## Breaking changes\n';
@@ -118,7 +161,8 @@ function renderNotes(prs: PullRequest[]): string {
 }
 
 async function main(): Promise<void> {
-  const prs = await collectMergedPRs();
+  const since = await getSinceDate();
+  const prs = await collectMergedPRs(since);
   const notes = renderNotes(prs);
   await writeFile('RELEASE_NOTES.md', notes, 'utf8');
   console.log('WROTE RELEASE_NOTES.md');
