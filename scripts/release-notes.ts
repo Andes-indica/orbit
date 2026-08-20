@@ -30,10 +30,13 @@ async function getSinceDate(): Promise<string> {
     return new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
   }
 
-  const proc = Bun.spawn(['git', 'log', '-1', '--format=%cI', lastTag], {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
+  const proc = Bun.spawn(
+    ['git', 'for-each-ref', `refs/tags/${lastTag}`, '--format=%(taggerdate:iso-strict)'],
+    {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
 
   const output = await new Response(proc.stdout).text();
   const error = await new Response(proc.stderr).text();
