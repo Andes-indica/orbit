@@ -107,26 +107,68 @@ describe('published release boundary selection', () => {
 });
 
 describe('dated tag selection', () => {
-  test('recovers an orphan tag on the same day when it points at the target', () => {
-    expect(selectDatedTag('2026.08.21', 'target', { '2026.08.21': 'target' })).toEqual({
+  test('reuses an existing tag when it already points at the target', () => {
+    expect(
+      selectDatedTag(
+        '2026.08.21',
+        'target',
+        {
+          '2026.08.21': 'target',
+        },
+        new Set(),
+      ),
+    ).toEqual({
       tag: '2026.08.21',
-      reuse: true,
+      action: 'reuse',
     });
   });
 
-  test('does not create a suffix for a same-day retry of the same target', () => {
+  test('does not create a suffix for a same-target retry', () => {
     expect(
-      selectDatedTag('2026.08.21', 'target', {
-        '2026.08.21': 'target',
-        '2026.08.21-1': 'other',
-      }),
-    ).toEqual({ tag: '2026.08.21', reuse: true });
+      selectDatedTag(
+        '2026.08.21',
+        'target',
+        {
+          '2026.08.21': 'target',
+          '2026.08.21-1': 'other',
+        },
+        new Set(),
+      ),
+    ).toEqual({
+      tag: '2026.08.21',
+      action: 'reuse',
+    });
   });
 
-  test('uses the next suffix when an existing dated tag targets another commit', () => {
-    expect(selectDatedTag('2026.08.21', 'target', { '2026.08.21': 'other' })).toEqual({
+  test('repairs an unpublished orphan when main has advanced', () => {
+    expect(
+      selectDatedTag(
+        '2026.08.21',
+        'new-target',
+        {
+          '2026.08.21': 'old-target',
+        },
+        new Set(),
+      ),
+    ).toEqual({
+      tag: '2026.08.21',
+      action: 'repair',
+    });
+  });
+
+  test('uses a suffix instead of moving a published tag', () => {
+    expect(
+      selectDatedTag(
+        '2026.08.21',
+        'new-target',
+        {
+          '2026.08.21': 'old-target',
+        },
+        new Set(['2026.08.21']),
+      ),
+    ).toEqual({
       tag: '2026.08.21-1',
-      reuse: false,
+      action: 'create',
     });
   });
 });

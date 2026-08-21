@@ -62,27 +62,48 @@ jobs:
         run: |
           set -euo pipefail
 
-          TAG="${{ steps.build_notes.outputs.tag }}"
-          REUSE_TAG="${{ steps.build_notes.outputs.reuse_tag }}"
+                    TAG="${{ steps.build_notes.outputs.tag }}"
+          TAG_ACTION="${{ steps.build_notes.outputs.tag_action }}"
 
-          if [ "$REUSE_TAG" = "true" ]; then
-            EXISTING_SHA=$(git rev-list -n 1 "$TAG^{commit}")
-            if [ "$EXISTING_SHA" != "$TARGET_SHA" ]; then
-              echo "Selected tag $TAG does not point to target $TARGET_SHA"
+          case "$TAG_ACTION" in
+            reuse)
+              EXISTING_SHA=$(git rev-list -n 1 "$TAG^{commit}")
+              if [ "$EXISTING_SHA" != "$TARGET_SHA" ]; then
+                echo "Selected tag $TAG does not point to target $TARGET_SHA"
+                exit 1
+              fi
+              echo "Reusing existing tag $TAG at $TARGET_SHA"
+              ;;
+
+            repair)
+              if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                echo "Refusing to move $TAG because it now has a GitHub release"
+                exit 1
+              fi
+
+              OLD_TAG_OBJECT=$(git rev-parse "refs/tags/$TAG")
+              echo "Repairing unpublished tag $TAG at $TARGET_SHA"
+              git tag -fa "$TAG" "$TARGET_SHA" -m "Automated release $TAG"
+              git push \
+                --force-with-lease="refs/tags/$TAG:$OLD_TAG_OBJECT" \
+                origin "refs/tags/$TAG"
+              ;;
+
+            create)
+              echo "Creating annotated tag $TAG at $TARGET_SHA"
+              git tag -a "$TAG" "$TARGET_SHA" -m "Automated release $TAG"
+              git push origin "refs/tags/$TAG"
+              ;;
+
+            *)
+              echo "Unknown tag action: $TAG_ACTION"
               exit 1
-            fi
-            echo "Reusing existing tag $TAG at $TARGET_SHA"
-          else
-            echo "Creating annotated tag $TAG at $TARGET_SHA"
-            git tag -a "$TAG" "$TARGET_SHA" -m "Automated release $TAG"
-            git push origin "refs/tags/$TAG"
-          fi
-
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
       - name: Publish or recover GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.release_tag.outputs.tag }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
         run: |
           set -euo pipefail
 

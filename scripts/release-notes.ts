@@ -79,7 +79,10 @@ export function selectLatestPublishedRelease(releases: GitHubRelease[]): GitHubR
   );
 }
 
-async function getLastPublishedReleaseTarget(): Promise<string> {
+async function getReleaseBoundary(): Promise<{
+  baseSha: string;
+  publishedTags: Set<string>;
+}> {
   const { owner, repoName } = getRepositoryParts();
   const published: GitHubRelease[] = [];
 
@@ -101,31 +104,46 @@ async function getLastPublishedReleaseTarget(): Promise<string> {
   }
 
   const latest = selectLatestPublishedRelease(published);
+  const publishedTags = new Set(published.map((release) => release.tag_name));
 
   if (latest) {
-    return await runGit(['rev-list', '-n', '1', `${latest.tag_name}^{commit}`]);
+    const baseSha = await runGit(['rev-list', '-n', '1', `${latest.tag_name}^{commit}`]);
+    return { baseSha, publishedTags };
   }
 
-  return await runGit(['rev-list', '--max-parents=0', targetSha]);
+  const baseSha = await runGit(['rev-list', '--max-parents=0', targetSha]);
+  return { baseSha, publishedTags };
 }
+
+type TagAction = 'create' | 'reuse' | 'repair';
 
 export function selectDatedTag(
   baseTag: string,
   targetSha: string,
   existingTags: Record<string, string>,
-): { tag: string; reuse: boolean } {
+  publishedTags: Set<string>,
+): { tag: string; action: TagAction } {
   let count = 0;
+
   while (true) {
     const tag = count === 0 ? baseTag : `${baseTag}-${count}`;
     const existingSha = existingTags[tag];
 
-    if (!existingSha) return { tag, reuse: false };
-    if (existingSha === targetSha) return { tag, reuse: true };
+    if (!existingSha) {
+      return { tag, action: 'create' };
+    }
+
+    if (existingSha === targetSha) {
+      return { tag, action: 'reuse' };
+    }
+
+    if (!publishedTags.has(tag)) {
+      return { tag, action: 'repair' };
+    }
 
     count += 1;
   }
 }
-
 async function getExistingDatedTags(baseTag: string): Promise<Record<string, string>> {
   const output = await runGit([
     'for-each-ref',
@@ -282,16 +300,15 @@ async function main(): Promise<void> {
     throw new Error(`Checked-out main is ${checkedOutSha}, expected release target ${targetSha}`);
   }
 
-  const baseSha = await getLastPublishedReleaseTarget();
+  const { baseSha, publishedTags } = await getReleaseBoundary();
   const prs = await collectPullRequests(baseSha);
   const notes = renderNotes(prs, baseSha, targetSha);
   const baseTag = new Date().toISOString().slice(0, 10).replaceAll('-', '.');
   const existingTags = await getExistingDatedTags(baseTag);
-  const selectedTag = selectDatedTag(baseTag, targetSha, existingTags);
-
+  const selectedTag = selectDatedTag(baseTag, targetSha, existingTags, publishedTags);
   await writeFile('RELEASE_NOTES.md', notes, 'utf8');
   await writeGitHubOutput('tag', selectedTag.tag);
-  await writeGitHubOutput('reuse_tag', String(selectedTag.reuse));
+  await writeGitHubOutput('reuse_tag', String(selectedTag.action));
   console.log(`Release range: ${baseSha}..${targetSha}`);
   console.log(`Release PRs: ${prs.length}`);
   console.log('WROTE RELEASE_NOTES.md');
