@@ -4,6 +4,7 @@ on:
   schedule:
     - cron: '0 0 * * 0'
   workflow_dispatch:
+
 concurrency:
   group: automated-release
   cancel-in-progress: false
@@ -17,10 +18,19 @@ jobs:
     name: Create dated tag and release notes
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout current main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: main
           fetch-depth: 0
+
+      - name: Determine release target
+        id: target
+        run: |
+          set -euo pipefail
+          TARGET_SHA=$(git rev-parse HEAD)
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "Release target: $TARGET_SHA"
 
       - name: Configure git
         run: |
@@ -39,36 +49,63 @@ jobs:
         id: build_notes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
+          RELEASE_TARGET_SHA: ${{ steps.target.outputs.target_sha }}
         run: |
           set -euo pipefail
           bun ./scripts/release-notes.ts
-          echo "notes_path=RELEASE_NOTES.md" >> "$GITHUB_OUTPUT"
+          test -s RELEASE_NOTES.md
 
-      - name: Create dated tag
-        id: create_tag
-        run: |
-          set -euo pipefail
-          BASE_TAG=$(date -u +%Y.%m.%d)
-          TAG="$BASE_TAG"
-          COUNT=0
-          while git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; do
-            COUNT=$((COUNT+1))
-            TAG="$BASE_TAG-$COUNT"
-          done
-          echo "Tag will be: $TAG"
-          git tag -a "$TAG" -m "Automated release $TAG" $GITHUB_SHA
-          git push origin "$TAG"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub release
+      - name: Select or recover dated tag
+        id: release_tag
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
         run: |
           set -euo pipefail
-          TAG=${{ steps.create_tag.outputs.tag }}
-          if [ ! -f RELEASE_NOTES.md ]; then
-            echo "No release notes found, creating placeholder."
-            echo "Automated release for ${GITHUB_SHA}" > RELEASE_NOTES.md
+
+          TAG="${{ steps.build_notes.outputs.tag }}"
+          REUSE_TAG="${{ steps.build_notes.outputs.reuse_tag }}"
+
+          if [ "$REUSE_TAG" = "true" ]; then
+            EXISTING_SHA=$(git rev-list -n 1 "$TAG^{commit}")
+            if [ "$EXISTING_SHA" != "$TARGET_SHA" ]; then
+              echo "Selected tag $TAG does not point to target $TARGET_SHA"
+              exit 1
+            fi
+            echo "Reusing existing tag $TAG at $TARGET_SHA"
+          else
+            echo "Creating annotated tag $TAG at $TARGET_SHA"
+            git tag -a "$TAG" "$TARGET_SHA" -m "Automated release $TAG"
+            git push origin "refs/tags/$TAG"
           fi
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file RELEASE_NOTES.md
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Publish or recover GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            DRAFT=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)
+            PRERELEASE=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)
+
+            if [ "$DRAFT" = "true" ] || [ "$PRERELEASE" = "true" ]; then
+              echo "Publishing existing release $TAG"
+              gh release edit "$TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --draft=false \
+                --prerelease=false \
+                --notes-file RELEASE_NOTES.md
+            else
+              echo "Release $TAG already exists. Nothing to publish."
+            fi
+            exit 0
+          fi
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file RELEASE_NOTES.md
+
+          echo "Published release $TAG"

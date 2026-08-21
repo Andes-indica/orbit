@@ -1,154 +1,257 @@
 #!/usr/bin/env bun
 import { writeFile } from 'node:fs/promises';
+import {
+  commitPageSchema,
+  type GitHubCommit,
+  type GitHubRelease,
+  type PullRequest,
+  pullRequestListSchema,
+  releaseListSchema,
+} from '@orbit/shared/validators';
 
-type Label = { name: string };
-type PullRequest = {
-  number: number;
-  title: string;
-  html_url: string;
-  body?: string | null;
-  labels?: Label[];
-  merged_at?: string | null;
-  updated_at: string;
-};
+const repo = process.env['GITHUB_REPOSITORY'] ?? '';
+const token = process.env['GITHUB_TOKEN'] ?? '';
+const targetSha = process.env['RELEASE_TARGET_SHA'] ?? '';
 
-const repo = process.env['GITHUB_REPOSITORY'];
-const token = process.env['GITHUB_TOKEN'];
+function getRepositoryParts(): { owner: string; repoName: string } {
+  const parts = repo.split('/');
 
-const githubSha = process.env['GITHUB_SHA'] || '';
-
-if (!repo) {
-  console.error('GITHUB_REPOSITORY is not set');
-  process.exitCode = 2;
-  throw new Error('GITHUB_REPOSITORY is not set');
-}
-
-async function getSinceDate(): Promise<string> {
-  const lastTag = await getLastTag();
-
-  if (!lastTag) {
-    return new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+  if (parts.length !== 2) {
+    throw new Error(`Invalid GITHUB_REPOSITORY: ${repo}`);
   }
 
-  const proc = Bun.spawn(
-    ['git', 'for-each-ref', `refs/tags/${lastTag}`, '--format=%(taggerdate:iso-strict)'],
-    {
-      stdout: 'pipe',
-      stderr: 'pipe',
-    },
-  );
+  const [owner, repoName] = parts;
 
-  const output = await new Response(proc.stdout).text();
-  const error = await new Response(proc.stderr).text();
-  const exitCode = await proc.exited;
-
-  if (exitCode !== 0 || !output.trim()) {
-    throw new Error(`Failed to determine date for tag ${lastTag}: ${error.trim()}`);
+  if (!(owner && repoName)) {
+    throw new Error(`Invalid GITHUB_REPOSITORY: ${repo}`);
   }
 
-  return output.trim();
+  return { owner, repoName };
 }
-const [owner, repoName] = repo.split('/');
 
 const headers: Record<string, string> = {
   Accept: 'application/vnd.github+json',
   'User-Agent': 'orbit-release-bot',
 };
-if (token) headers['Authorization'] = `token ${token}`;
+if (token) headers['Authorization'] = `Bearer ${token}`;
 
 async function fetchJson(url: string): Promise<unknown> {
-  const res = await fetch(url, { headers });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`Request failed ${res.status}: ${text}`);
+  const response = await fetch(url, { headers });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`GitHub API request failed (${response.status}): ${text}`);
   }
-  return JSON.parse(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`GitHub API returned invalid JSON: ${url}`);
+  }
 }
-async function getLastTag(): Promise<string | null> {
-  const proc = Bun.spawn(['git', 'describe', '--tags', '--abbrev=0'], {
+
+async function runGit(args: string[]): Promise<string> {
+  const proc = Bun.spawn(['git', ...args], {
     stdout: 'pipe',
     stderr: 'pipe',
   });
-
-  const output = await new Response(proc.stdout).text();
-  const error = await new Response(proc.stderr).text();
+  const stdout = await new Response(proc.stdout).text();
+  const stderr = await new Response(proc.stderr).text();
   const exitCode = await proc.exited;
-
   if (exitCode !== 0) {
-    if (error.trim()) {
-      console.warn(`Could not determine last tag: ${error.trim()}`);
-    }
-    return null;
+    throw new Error(`git ${args.join(' ')} failed: ${stderr.trim()}`);
   }
-
-  return output.trim() || null;
+  return stdout.trim();
 }
 
-async function fetchPageOfPRs(page: number): Promise<PullRequest[]> {
-  const url = `https://api.github.com/repos/${owner}/${repoName}/pulls?state=closed&per_page=100&sort=updated&direction=desc&page=${page}`;
-  const data = await fetchJson(url);
-  if (!Array.isArray(data)) return [];
-  return data as PullRequest[];
+function isDatedReleaseTag(tag: string): boolean {
+  return /^\d{4}\.\d{2}\.\d{2}(?:-\d+)?$/.test(tag);
 }
 
-async function collectMergedPRs(since: string): Promise<PullRequest[]> {
-  const merged: PullRequest[] = [];
-  const sinceDate = new Date(since);
+export function selectLatestPublishedRelease(releases: GitHubRelease[]): GitHubRelease | null {
+  const published = releases.filter(
+    (release) =>
+      !(release.draft || release.prerelease) &&
+      release.published_at !== null &&
+      isDatedReleaseTag(release.tag_name),
+  );
+
+  return (
+    published.sort((a, b) => (b.published_at ?? '').localeCompare(a.published_at ?? ''))[0] ?? null
+  );
+}
+
+async function getLastPublishedReleaseTarget(): Promise<string> {
+  const { owner, repoName } = getRepositoryParts();
+  const published: GitHubRelease[] = [];
+
   for (let page = 1; ; page++) {
-    const pagePRs = await fetchPageOfPRs(page);
-    if (pagePRs.length === 0) break;
-    for (const p of pagePRs) {
-      if (new Date(p.updated_at) < sinceDate) return merged;
+    const url = `https://api.github.com/repos/${owner}/${repoName}/releases?per_page=100&page=${page}`;
+    const releases = releaseListSchema.parse(await fetchJson(url));
+    if (releases.length === 0) break;
 
-      if (!p.merged_at) continue;
+    published.push(
+      ...releases.filter(
+        (release) =>
+          !(release.draft || release.prerelease) &&
+          release.published_at !== null &&
+          isDatedReleaseTag(release.tag_name),
+      ),
+    );
 
-      if (new Date(p.merged_at) >= sinceDate) {
-        merged.push(p);
-      }
-    }
-    if (pagePRs.length < 100) break;
+    if (releases.length < 100) break;
   }
-  return merged;
+
+  const latest = selectLatestPublishedRelease(published);
+
+  if (latest) {
+    return await runGit(['rev-list', '-n', '1', `${latest.tag_name}^{commit}`]);
+  }
+
+  return await runGit(['rev-list', '--max-parents=0', targetSha]);
 }
 
-function groupByArea(prs: PullRequest[]) {
+export function selectDatedTag(
+  baseTag: string,
+  targetSha: string,
+  existingTags: Record<string, string>,
+): { tag: string; reuse: boolean } {
+  let count = 0;
+  while (true) {
+    const tag = count === 0 ? baseTag : `${baseTag}-${count}`;
+    const existingSha = existingTags[tag];
+
+    if (!existingSha) return { tag, reuse: false };
+    if (existingSha === targetSha) return { tag, reuse: true };
+
+    count += 1;
+  }
+}
+
+async function getExistingDatedTags(baseTag: string): Promise<Record<string, string>> {
+  const output = await runGit([
+    'for-each-ref',
+    'refs/tags',
+    '--format=%(refname:strip=2) %(objectname)',
+  ]);
+  const tags: Record<string, string> = {};
+
+  for (const line of output.split('\n')) {
+    const [tag] = line.split(' ');
+    if (!tag?.startsWith(baseTag)) continue;
+    if (!isDatedReleaseTag(tag)) continue;
+    tags[tag] = await runGit(['rev-list', '-n', '1', `${tag}^{commit}`]);
+  }
+
+  return tags;
+}
+
+async function writeGitHubOutput(name: string, value: string): Promise<void> {
+  const outputPath = process.env['GITHUB_OUTPUT'];
+  if (!outputPath) return;
+  await writeFile(outputPath, `${name}=${value}\n`, { flag: 'a' });
+}
+
+async function fetchCommitPage(page: number): Promise<GitHubCommit[]> {
+  const { owner, repoName } = getRepositoryParts();
+  const url = `https://api.github.com/repos/${owner}/${repoName}/commits?sha=${targetSha}&per_page=100&page=${page}`;
+  return commitPageSchema.parse(await fetchJson(url));
+}
+
+async function fetchPullRequestsForCommit(sha: string): Promise<PullRequest[]> {
+  const { owner, repoName } = getRepositoryParts();
+  const url = `https://api.github.com/repos/${owner}/${repoName}/commits/${sha}/pulls`;
+  return pullRequestListSchema.parse(await fetchJson(url));
+}
+
+export function collectCommitsInRange(baseSha: string, pages: GitHubCommit[][]): GitHubCommit[] {
+  const commits: GitHubCommit[] = [];
+
+  for (const page of pages) {
+    for (const commit of page) {
+      if (commit.sha === baseSha) return commits;
+      commits.push(commit);
+    }
+
+    if (page.length < 100) {
+      throw new Error(`Release base ${baseSha} was not found in the main history`);
+    }
+  }
+
+  throw new Error(`Release base ${baseSha} was not found in the main history`);
+}
+async function collectPullRequests(baseSha: string): Promise<PullRequest[]> {
+  const pages: GitHubCommit[][] = [];
+
+  for (let page = 1; ; page++) {
+    const pageCommits = await fetchCommitPage(page);
+    pages.push(pageCommits);
+
+    if (pageCommits.some((commit) => commit.sha === baseSha)) break;
+    if (pageCommits.length < 100) {
+      throw new Error(`Release base ${baseSha} was not found in the main history`);
+    }
+  }
+
+  const commits = collectCommitsInRange(baseSha, pages);
+  const prs = new Map<number, PullRequest>();
+
+  for (const commit of commits) {
+    const associatedPRs = await fetchPullRequestsForCommit(commit.sha);
+    for (const pr of associatedPRs) {
+      if (isMainReleasePR(pr)) prs.set(pr.number, pr);
+    }
+  }
+
+  return [...prs.values()].sort((a, b) => a.number - b.number);
+}
+
+export function isMainReleasePR(pr: PullRequest): boolean {
+  return Boolean(pr.merged_at) && pr.base.ref === 'main';
+}
+
+export function groupByArea(prs: PullRequest[]) {
   const areas: Record<string, PullRequest[]> = {};
   const breaking: PullRequest[] = [];
-  for (const p of prs) {
-    const labels = (p.labels || []).map((l) => l.name);
-    const body: string = p.body || '';
-    const hasBreakingLabel = labels.some((n) => n.toLowerCase() === 'breaking change');
-    const hasBreakingBody = /BREAKING CHANGE/.test(body);
+
+  for (const pr of prs) {
+    const labels = pr.labels.map((label) => label.name);
+    const hasBreakingLabel = labels.some((name) => name.toLowerCase() === 'breaking change');
+    const hasBreakingBody = /\bBREAKING CHANGE\b/i.test(pr.body ?? '');
+
     if (hasBreakingLabel || hasBreakingBody) {
-      breaking.push(p);
+      breaking.push(pr);
       continue;
     }
-    const area = labels.find((n) => n.startsWith('area:')) || 'Other';
-    areas[area] = areas[area] || [];
-    areas[area].push(p);
+
+    const area = labels.find((name) => name.startsWith('area:')) ?? 'Other';
+    areas[area] ??= [];
+    areas[area].push(pr);
   }
+
   return { areas, breaking };
 }
 
-function renderNotes(prs: PullRequest[]): string {
+export function renderNotes(prs: PullRequest[], baseSha: string, targetSha: string): string {
   const { areas, breaking } = groupByArea(prs);
-  let body = `Automated release for ${githubSha}\n\n`;
+  let body = `Automated release for ${targetSha}\n\n`;
+  body += `Changes: ${baseSha}..${targetSha}\n\n`;
 
   if (breaking.length) {
-    body += '## Breaking changes\n';
+    body += '## Breaking changes\n\n';
+    body +=
+      '> Action required: review the linked pull requests for database migrations, ' +
+      'new environment variables, or other deployment changes before upgrading.\n\n';
     for (const pr of breaking) {
       body += `- ${pr.title} (#${pr.number}) ${pr.html_url}\n`;
       if (pr.body) {
-        const excerpt = pr.body.split(/\r?\n/).slice(0, 6).join('\n  ');
-        body += `\n  ${excerpt}\n`;
+        const excerpt = pr.body.split(/\r?\n/).slice(0, 6).join('\n  ').trim();
+        if (excerpt) body += `\n  ${excerpt}\n`;
       }
     }
     body += '\n';
   }
 
-  const areaNames = Object.keys(areas).sort();
-  for (const area of areaNames) {
-    const title = area.replace('area:', 'Area: ');
+  for (const area of Object.keys(areas).sort()) {
+    const title = area === 'Other' ? area : area.replace(/^area:/, 'Area: ');
     body += `## ${title}\n`;
     for (const pr of areas[area] ?? []) {
       body += `- ${pr.title} (#${pr.number}) ${pr.html_url}\n`;
@@ -156,22 +259,47 @@ function renderNotes(prs: PullRequest[]): string {
     body += '\n';
   }
 
-  if (!breaking.length && areaNames.length === 0) {
-    body += 'No merged pull requests found since the last tag.\n';
+  if (!breaking.length && Object.keys(areas).length === 0) {
+    body += 'No merged pull requests found in this release range.\n';
   }
 
   return body;
 }
 
 async function main(): Promise<void> {
-  const since = await getSinceDate();
-  const prs = await collectMergedPRs(since);
-  const notes = renderNotes(prs);
+  if (!repo) {
+    throw new Error('GITHUB_REPOSITORY is not set');
+  }
+  if (!token) {
+    throw new Error('GITHUB_TOKEN is not set');
+  }
+  if (!targetSha) {
+    throw new Error('RELEASE_TARGET_SHA is not set');
+  }
+
+  const checkedOutSha = await runGit(['rev-parse', 'HEAD']);
+  if (checkedOutSha !== targetSha) {
+    throw new Error(`Checked-out main is ${checkedOutSha}, expected release target ${targetSha}`);
+  }
+
+  const baseSha = await getLastPublishedReleaseTarget();
+  const prs = await collectPullRequests(baseSha);
+  const notes = renderNotes(prs, baseSha, targetSha);
+  const baseTag = new Date().toISOString().slice(0, 10).replaceAll('-', '.');
+  const existingTags = await getExistingDatedTags(baseTag);
+  const selectedTag = selectDatedTag(baseTag, targetSha, existingTags);
+
   await writeFile('RELEASE_NOTES.md', notes, 'utf8');
+  await writeGitHubOutput('tag', selectedTag.tag);
+  await writeGitHubOutput('reuse_tag', String(selectedTag.reuse));
+  console.log(`Release range: ${baseSha}..${targetSha}`);
+  console.log(`Release PRs: ${prs.length}`);
   console.log('WROTE RELEASE_NOTES.md');
 }
 
-main().catch((err: unknown) => {
-  console.error('Failed to generate release notes:', err);
-  process.exitCode = 2;
-});
+if (import.meta.main) {
+  main().catch((error: unknown) => {
+    console.error('Failed to generate release notes:', error);
+    process.exitCode = 2;
+  });
+}
