@@ -50,17 +50,17 @@ jobs:
         id: build_notes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          RELEASE_TARGET_SHA: ${{ steps.build_notes.outputs.release_target_sha }}
         run: |
           set -euo pipefail
           bun ./scripts/release-notes.ts
           test -s RELEASE_NOTES.md
 
-      - name: Select or recover dated tag
+            - name: Select or recover dated tag
         id: release_tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET_SHA: ${{ steps.target.outputs.target_sha }}
+          RELEASE_TARGET_SHA: ${{ steps.build_notes.outputs.release_target_sha }}
         run: |
           set -euo pipefail
 
@@ -69,58 +69,20 @@ jobs:
           REPOSITORY_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           case "$TAG_ACTION" in
-            reuse)
+            reuse|recover)
               EXISTING_SHA=$(git rev-list -n 1 "$TAG^{commit}")
-              if [ "$EXISTING_SHA" != "$TARGET_SHA" ]; then
-                echo "Selected tag $TAG does not point to target $TARGET_SHA"
+
+              if [ "$EXISTING_SHA" != "$RELEASE_TARGET_SHA" ]; then
+                echo "Selected tag $TAG does not point to release target $RELEASE_TARGET_SHA"
                 exit 1
               fi
-              echo "Reusing existing tag $TAG at $TARGET_SHA"
-              ;;
 
-            repair)
-              RELEASE_RESPONSE=$(mktemp)
-              RELEASE_STATUS=$(
-                curl \
-                  --silent \
-                  --show-error \
-                  --connect-timeout 10 \
-                  --max-time 30 \
-                  --output "$RELEASE_RESPONSE" \
-                  --write-out '%{http_code}' \
-                  --header "Authorization: Bearer $GH_TOKEN" \
-                  --header "Accept: application/vnd.github+json" \
-                  --header "X-GitHub-Api-Version: 2022-11-28" \
-                  "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}"
-              )
-
-              case "$RELEASE_STATUS" in
-                200)
-                  echo "Refusing to move $TAG because it has a GitHub release"
-                  exit 1
-                  ;;
-                404)
-                  echo "Confirmed that $TAG has no GitHub release"
-                  ;;
-                *)
-                  echo "Unable to verify whether $TAG has a release (HTTP $RELEASE_STATUS)"
-                  cat "$RELEASE_RESPONSE"
-                  exit 1
-                  ;;
-              esac
-
-              OLD_TAG_OBJECT=$(git rev-parse "refs/tags/$TAG")
-              echo "Repairing unpublished tag $TAG at $TARGET_SHA"
-              git tag -fa "$TAG" "$TARGET_SHA" -m "Automated release $TAG"
-              git push \
-                --force-with-lease="refs/tags/$TAG:$OLD_TAG_OBJECT" \
-                "$REPOSITORY_URL" \
-                "refs/tags/$TAG"
+              echo "Using existing tag $TAG at $RELEASE_TARGET_SHA"
               ;;
 
             create)
-              echo "Creating annotated tag $TAG at $TARGET_SHA"
-              git tag -a "$TAG" "$TARGET_SHA" -m "Automated release $TAG"
+              echo "Creating annotated tag $TAG at $RELEASE_TARGET_SHA"
+              git tag -a "$TAG" "$RELEASE_TARGET_SHA" -m "Automated release $TAG"
               git push "$REPOSITORY_URL" "refs/tags/$TAG"
               ;;
 
@@ -134,7 +96,7 @@ jobs:
 
       - name: Publish or recover GitHub release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.target.outputs.target_sha}}
           TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           set -euo pipefail

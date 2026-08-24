@@ -95,16 +95,14 @@ export function selectLatestPublishedRelease(releases: GitHubRelease[]): GitHubR
   );
 }
 
-async function getReleaseBoundary(): Promise<{
-  baseSha: string;
-  publishedTags: Set<string>;
-}> {
+async function getPublishedReleases(): Promise<GitHubRelease[]> {
   const { owner, repoName } = getRepositoryParts();
   const published: GitHubRelease[] = [];
 
   for (let page = 1; ; page++) {
     const url = `https://api.github.com/repos/${owner}/${repoName}/releases?per_page=100&page=${page}`;
     const releases = releaseListSchema.parse(await fetchJson(url));
+
     if (releases.length === 0) break;
 
     published.push(
@@ -119,26 +117,38 @@ async function getReleaseBoundary(): Promise<{
     if (releases.length < 100) break;
   }
 
-  const latest = selectLatestPublishedRelease(published);
-  const publishedTags = new Set(published.map((release) => release.tag_name));
-
-  if (latest) {
-    const baseSha = await runGit(['rev-list', '-n', '1', `${latest.tag_name}^{commit}`]);
-    return { baseSha, publishedTags };
-  }
-
-  const baseSha = await runGit(['rev-list', '--max-parents=0', targetSha]);
-  return { baseSha, publishedTags };
+  return published;
 }
 
-type TagAction = 'create' | 'reuse' | 'repair';
+async function getReleaseBoundary(
+  published: GitHubRelease[],
+  releaseTargetSha: string,
+): Promise<string> {
+  const latest = selectLatestPublishedRelease(published);
+
+  if (latest) {
+    return await runGit(['rev-list', '-n', '1', `${latest.tag_name}^{commit}`]);
+  }
+
+  const roots = await runGit(['rev-list', '--max-parents=0', releaseTargetSha]);
+
+  const [baseSha] = roots.split('\n');
+
+  if (!baseSha) {
+    throw new Error(`No initial commit found for ${releaseTargetSha}`);
+  }
+
+  return baseSha;
+}
+
+type TagAction = 'create' | 'reuse' | 'recover';
 
 export function selectDatedTag(
   baseTag: string,
   targetSha: string,
   existingTags: Record<string, string>,
   publishedTags: Set<string>,
-): { tag: string; action: TagAction } {
+): { tag: string; action: TagAction; releaseTargetSha: string } {
   let count = 0;
 
   while (true) {
@@ -146,15 +156,15 @@ export function selectDatedTag(
     const existingSha = existingTags[tag];
 
     if (!existingSha) {
-      return { tag, action: 'create' };
+      return { tag, action: 'create', releaseTargetSha: targetSha };
     }
 
     if (existingSha === targetSha) {
-      return { tag, action: 'reuse' };
+      return { tag, action: 'reuse', releaseTargetSha: existingSha };
     }
 
     if (!publishedTags.has(tag)) {
-      return { tag, action: 'repair' };
+      return { tag, action: 'recover', releaseTargetSha: existingSha };
     }
 
     count += 1;
@@ -184,9 +194,9 @@ async function writeGitHubOutput(name: string, value: string): Promise<void> {
   await writeFile(outputPath, `${name}=${value}\n`, { flag: 'a' });
 }
 
-async function fetchCommitPage(page: number): Promise<GitHubCommit[]> {
+async function fetchCommitPage(releaseTargetSha: string, page: number): Promise<GitHubCommit[]> {
   const { owner, repoName } = getRepositoryParts();
-  const url = `https://api.github.com/repos/${owner}/${repoName}/commits?sha=${targetSha}&per_page=100&page=${page}`;
+  const url = `https://api.github.com/repos/${owner}/${repoName}/commits?sha=${releaseTargetSha}&per_page=100&page=${page}`;
   return commitPageSchema.parse(await fetchJson(url));
 }
 
@@ -212,11 +222,14 @@ export function collectCommitsInRange(baseSha: string, pages: GitHubCommit[][]):
 
   throw new Error(`Release base ${baseSha} was not found in the main history`);
 }
-async function collectPullRequests(baseSha: string): Promise<PullRequest[]> {
+async function collectPullRequests(
+  baseSha: string,
+  releaseTargetsha: string,
+): Promise<PullRequest[]> {
   const pages: GitHubCommit[][] = [];
 
   for (let page = 1; ; page++) {
-    const pageCommits = await fetchCommitPage(page);
+    const pageCommits = await fetchCommitPage(releaseTargetsha, page);
     pages.push(pageCommits);
 
     if (pageCommits.some((commit) => commit.sha === baseSha)) break;
@@ -316,16 +329,19 @@ async function main(): Promise<void> {
     throw new Error(`Checked-out main is ${checkedOutSha}, expected release target ${targetSha}`);
   }
 
-  const { baseSha, publishedTags } = await getReleaseBoundary();
-  const prs = await collectPullRequests(baseSha);
-  const notes = renderNotes(prs, baseSha, targetSha);
+  const published = await getPublishedReleases();
+  const publishedTags = new Set(published.map((release) => release.tag_name));
   const baseTag = new Date().toISOString().slice(0, 10).replaceAll('-', '.');
   const existingTags = await getExistingDatedTags(baseTag);
   const selectedTag = selectDatedTag(baseTag, targetSha, existingTags, publishedTags);
+  const baseSha = await getReleaseBoundary(published, selectedTag.releaseTargetSha);
+  const prs = await collectPullRequests(baseSha, selectedTag.releaseTargetSha);
+  const notes = renderNotes(prs, baseSha, selectedTag.releaseTargetSha);
   await writeFile('RELEASE_NOTES.md', notes, 'utf8');
   await writeGitHubOutput('tag', selectedTag.tag);
-  await writeGitHubOutput('tag_action', String(selectedTag.action));
-  console.log(`Release range: ${baseSha}..${targetSha}`);
+  await writeGitHubOutput('tag_action', selectedTag.action);
+  await writeGitHubOutput('release_target_sha', selectedTag.releaseTargetSha);
+  console.log(`Release range: ${baseSha}..${selectedTag.releaseTargetSha}`);
   console.log(`Release PRs: ${prs.length}`);
   console.log('WROTE RELEASE_NOTES.md');
 }

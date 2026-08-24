@@ -120,6 +120,7 @@ describe('dated tag selection', () => {
     ).toEqual({
       tag: '2026.08.21',
       action: 'reuse',
+      releaseTargetSha: 'target',
     });
   });
 
@@ -137,10 +138,11 @@ describe('dated tag selection', () => {
     ).toEqual({
       tag: '2026.08.21',
       action: 'reuse',
+      releaseTargetSha: 'target',
     });
   });
 
-  test('repairs an unpublished orphan when main has advanced', () => {
+  test('recovers an unpublished orphan without moving its tag', () => {
     expect(
       selectDatedTag(
         '2026.08.21',
@@ -152,11 +154,12 @@ describe('dated tag selection', () => {
       ),
     ).toEqual({
       tag: '2026.08.21',
-      action: 'repair',
+      action: 'recover',
+      releaseTargetSha: 'old-target',
     });
   });
 
-  test('uses a suffix instead of moving a published tag', () => {
+  test('uses a suffix when the existing tag already has a published release', () => {
     expect(
       selectDatedTag(
         '2026.08.21',
@@ -169,6 +172,7 @@ describe('dated tag selection', () => {
     ).toEqual({
       tag: '2026.08.21-1',
       action: 'create',
+      releaseTargetSha: 'new-target',
     });
   });
 });
