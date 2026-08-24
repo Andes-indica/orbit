@@ -6,7 +6,7 @@ import {
   renderNotes,
   selectDatedTag,
   selectLatestPublishedRelease,
-} from '../../../scripts/release-notes';
+} from '../scripts/release-notes';
 
 const pr = (overrides: Record<string, unknown> = {}) => ({
   number: 1,

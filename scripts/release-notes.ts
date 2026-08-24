@@ -35,12 +35,28 @@ const headers: Record<string, string> = {
 };
 if (token) headers['Authorization'] = `Bearer ${token}`;
 
-async function fetchJson(url: string): Promise<unknown> {
-  const response = await fetch(url, { headers });
+const maxFetchAttempts = 4;
+const fetchTimeoutMs = 30_000;
+
+async function fetchJson(url: string, attempt = 1): Promise<unknown> {
+  const response = await fetch(url, {
+    headers,
+    signal: AbortSignal.timeout(fetchTimeoutMs),
+  });
+
   const text = await response.text();
+
   if (!response.ok) {
+    const retryable = response.status === 429 || response.status === 403 || response.status >= 500;
+
+    if (retryable && attempt < maxFetchAttempts) {
+      await Bun.sleep(2 ** attempt * 1_000);
+      return await fetchJson(url, attempt + 1);
+    }
+
     throw new Error(`GitHub API request failed (${response.status}): ${text}`);
   }
+
   try {
     return JSON.parse(text);
   } catch {
@@ -308,7 +324,7 @@ async function main(): Promise<void> {
   const selectedTag = selectDatedTag(baseTag, targetSha, existingTags, publishedTags);
   await writeFile('RELEASE_NOTES.md', notes, 'utf8');
   await writeGitHubOutput('tag', selectedTag.tag);
-  await writeGitHubOutput('reuse_tag', String(selectedTag.action));
+  await writeGitHubOutput('tag_action', String(selectedTag.action));
   console.log(`Release range: ${baseSha}..${targetSha}`);
   console.log(`Release PRs: ${prs.length}`);
   console.log('WROTE RELEASE_NOTES.md');
