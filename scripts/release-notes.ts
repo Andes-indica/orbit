@@ -91,16 +91,11 @@ export function datedTagsFromRefOutput(output: string): string[] {
   return tags;
 }
 
-export function selectLatestPublishedRelease(releases: GitHubRelease[]): GitHubRelease | null {
-  const published = releases.filter(
-    (release) =>
-      !(release.draft || release.prerelease) &&
-      release.published_at !== null &&
-      isDatedReleaseTag(release.tag_name),
-  );
-
+export function isPublishedDatedRelease(release: GitHubRelease): boolean {
   return (
-    published.sort((a, b) => (b.published_at ?? '').localeCompare(a.published_at ?? ''))[0] ?? null
+    !(release.draft || release.prerelease) &&
+    release.published_at !== null &&
+    isDatedReleaseTag(release.tag_name)
   );
 }
 
@@ -114,14 +109,7 @@ async function getPublishedReleases(): Promise<GitHubRelease[]> {
 
     if (releases.length === 0) break;
 
-    published.push(
-      ...releases.filter(
-        (release) =>
-          !(release.draft || release.prerelease) &&
-          release.published_at !== null &&
-          isDatedReleaseTag(release.tag_name),
-      ),
-    );
+    published.push(...releases.filter(isPublishedDatedRelease));
 
     if (releases.length < 100) break;
   }
@@ -129,25 +117,40 @@ async function getPublishedReleases(): Promise<GitHubRelease[]> {
   return published;
 }
 
-async function getReleaseBoundary(
-  published: GitHubRelease[],
+export function selectReleaseBoundary(
+  firstParentHistory: readonly string[],
   releaseTargetSha: string,
-): Promise<string> {
-  const latest = selectLatestPublishedRelease(published);
+  existingTags: Readonly<Record<string, string>>,
+  publishedTags: ReadonlySet<string>,
+): string {
+  const commitOrder = new Map(firstParentHistory.map((sha, index) => [sha, index]));
+  const targetIndex = commitOrder.get(releaseTargetSha);
 
-  if (latest) {
-    return await runGit(['rev-list', '-n', '1', `${latest.tag_name}^{commit}`]);
+  if (targetIndex === undefined) {
+    throw new Error(`Release target ${releaseTargetSha} is not in the first-parent history`);
   }
 
-  const roots = await runGit(['rev-list', '--max-parents=0', releaseTargetSha]);
+  let boundaryIndex = firstParentHistory.length;
 
-  const [baseSha] = roots.split('\n');
+  for (const [tag, sha] of Object.entries(existingTags)) {
+    if (!publishedTags.has(tag)) continue;
+    const candidateIndex = commitOrder.get(sha);
+    if (
+      candidateIndex !== undefined &&
+      candidateIndex >= targetIndex &&
+      candidateIndex < boundaryIndex
+    ) {
+      boundaryIndex = candidateIndex;
+    }
+  }
 
-  if (!baseSha) {
+  const boundary = firstParentHistory[boundaryIndex] ?? firstParentHistory.at(-1);
+
+  if (!boundary) {
     throw new Error(`No initial commit found for ${releaseTargetSha}`);
   }
 
-  return baseSha;
+  return boundary;
 }
 
 type TagAction = 'create' | 'reuse' | 'recover';
@@ -162,28 +165,14 @@ function compareDatedTags(left: string, right: string): number {
   return leftSuffix - rightSuffix;
 }
 
-export function eligibleReleaseCommits(
-  firstParentHistory: readonly string[],
-  baseSha: string,
-  includeBoundary: boolean,
-): string[] {
-  const boundaryIndex = firstParentHistory.indexOf(baseSha);
-  if (boundaryIndex === -1) {
-    throw new Error(`Release base ${baseSha} is not in the first-parent history`);
-  }
-  const commits = firstParentHistory.slice(0, boundaryIndex).reverse();
-  if (includeBoundary) commits.unshift(baseSha);
-  return commits;
-}
-
 export function selectDatedTag(
   baseTag: string,
   targetSha: string,
-  existingTags: Record<string, string>,
-  publishedTags: Set<string>,
-  eligibleCommits: readonly string[] = [],
+  existingTags: Readonly<Record<string, string>>,
+  publishedTags: ReadonlySet<string>,
+  firstParentHistory: readonly string[] = [],
 ): { tag: string; action: TagAction; releaseTargetSha: string } {
-  const commitOrder = new Map(eligibleCommits.map((sha, index) => [sha, index]));
+  const commitOrder = new Map([...firstParentHistory].reverse().map((sha, index) => [sha, index]));
   const orphan = Object.entries(existingTags)
     .filter(([tag, sha]) => !publishedTags.has(tag) && commitOrder.has(sha))
     .sort(([leftTag, leftSha], [rightTag, rightSha]) => {
@@ -373,21 +362,15 @@ async function main(): Promise<void> {
   const publishedTags = new Set(published.map((release) => release.tag_name));
   const baseTag = new Date().toISOString().slice(0, 10).replaceAll('-', '.');
   const existingTags = await getExistingDatedTags();
-  const baseSha = await getReleaseBoundary(published, targetSha);
   const history = (await runGit(['rev-list', '--first-parent', targetSha]))
     .split('\n')
     .filter((sha) => sha.length > 0);
-  const eligibleCommits = eligibleReleaseCommits(
+  const selectedTag = selectDatedTag(baseTag, targetSha, existingTags, publishedTags, history);
+  const baseSha = selectReleaseBoundary(
     history,
-    baseSha,
-    selectLatestPublishedRelease(published) === null,
-  );
-  const selectedTag = selectDatedTag(
-    baseTag,
-    targetSha,
+    selectedTag.releaseTargetSha,
     existingTags,
     publishedTags,
-    eligibleCommits,
   );
   const prs = await collectPullRequests(baseSha, selectedTag.releaseTargetSha);
   const notes = renderNotes(prs, baseSha, selectedTag.releaseTargetSha);

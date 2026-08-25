@@ -2,12 +2,12 @@ import { describe, expect, test } from 'bun:test';
 import {
   collectCommitsInRange,
   datedTagsFromRefOutput,
-  eligibleReleaseCommits,
   groupByArea,
   isMainReleasePR,
+  isPublishedDatedRelease,
   renderNotes,
   selectDatedTag,
-  selectLatestPublishedRelease,
+  selectReleaseBoundary,
 } from '../scripts/release-notes';
 
 const pr = (overrides: Record<string, unknown> = {}) => ({
@@ -67,44 +67,96 @@ describe('release range pagination', () => {
 });
 
 describe('published release boundary selection', () => {
-  test('ignores drafts, prereleases, and unrelated tags', () => {
-    const latest = selectLatestPublishedRelease([
-      {
+  const history = [
+    'current-target',
+    'newer-published',
+    'orphan-target',
+    'older-published',
+    'root-target',
+  ];
+  const existingTags = {
+    '2026.08.18': 'older-published',
+    '2026.08.19': 'orphan-target',
+    '2026.08.20': 'newer-published',
+    '2026.08.21': 'off-main',
+  };
+
+  test('accepts only published dated releases', () => {
+    expect(
+      isPublishedDatedRelease({
         tag_name: '2026.08.20',
         draft: false,
         prerelease: false,
         published_at: '2026-08-20T00:00:00Z',
-      },
-      { tag_name: '2026.08.21', draft: true, prerelease: false, published_at: null },
-      { tag_name: 'v1.0.0', draft: false, prerelease: false, published_at: '2026-08-21T00:00:00Z' },
-      {
-        tag_name: '2026.08.19',
+      }),
+    ).toBe(true);
+    expect(
+      isPublishedDatedRelease({
+        tag_name: '2026.08.20',
+        draft: true,
+        prerelease: false,
+        published_at: null,
+      }),
+    ).toBe(false);
+    expect(
+      isPublishedDatedRelease({
+        tag_name: '2026.08.20',
         draft: false,
         prerelease: true,
-        published_at: '2026-08-19T00:00:00Z',
-      },
-    ]);
-
-    expect(latest?.tag_name).toBe('2026.08.20');
-  });
-
-  test('uses publication time rather than array order', () => {
-    const latest = selectLatestPublishedRelease([
-      {
-        tag_name: '2026.08.20',
+        published_at: '2026-08-20T00:00:00Z',
+      }),
+    ).toBe(false);
+    expect(
+      isPublishedDatedRelease({
+        tag_name: 'v1.0.0',
         draft: false,
         prerelease: false,
         published_at: '2026-08-20T00:00:00Z',
-      },
-      {
-        tag_name: '2026.08.21',
-        draft: false,
-        prerelease: false,
-        published_at: '2026-08-21T00:00:00Z',
-      },
-    ]);
+      }),
+    ).toBe(false);
+  });
 
-    expect(latest?.tag_name).toBe('2026.08.21');
+  test('uses the nearest published commit at or before the selected target', () => {
+    expect(
+      selectReleaseBoundary(
+        history,
+        'orphan-target',
+        existingTags,
+        new Set(['2026.08.18', '2026.08.20']),
+      ),
+    ).toBe('older-published');
+  });
+
+  test('uses the newer commit boundary after a historical orphan is published', () => {
+    expect(
+      selectReleaseBoundary(
+        history,
+        'current-target',
+        existingTags,
+        new Set(['2026.08.18', '2026.08.19', '2026.08.20']),
+      ),
+    ).toBe('newer-published');
+  });
+
+  test('ignores published tags outside the target first-parent history', () => {
+    expect(
+      selectReleaseBoundary(history, 'current-target', existingTags, new Set(['2026.08.21'])),
+    ).toBe('root-target');
+  });
+
+  test('uses the root when no published boundary precedes the target', () => {
+    expect(selectReleaseBoundary(history, 'orphan-target', existingTags, new Set())).toBe(
+      'root-target',
+    );
+    expect(selectReleaseBoundary(history, 'root-target', existingTags, new Set())).toBe(
+      'root-target',
+    );
+  });
+
+  test('fails closed when the selected target is outside first-parent history', () => {
+    expect(() =>
+      selectReleaseBoundary(history, 'off-main', existingTags, new Set(['2026.08.21'])),
+    ).toThrow('is not in the first-parent history');
   });
 });
 
@@ -161,7 +213,7 @@ describe('dated tag selection', () => {
           '2026.08.21': 'old-target',
         },
         new Set(),
-        ['old-target', 'new-target'],
+        ['new-target', 'old-target'],
       ),
     ).toEqual({
       tag: '2026.08.21',
@@ -196,7 +248,7 @@ describe('dated tag selection', () => {
           '2026.08.21': 'orphan-target',
         },
         new Set(),
-        ['orphan-target', 'current-target'],
+        ['current-target', 'orphan-target'],
       ),
     ).toEqual({
       tag: '2026.08.21',
@@ -205,18 +257,66 @@ describe('dated tag selection', () => {
     });
   });
 
+  test('recovers an orphan older than a later published release', () => {
+    const history = [
+      'current-target',
+      'newer-published',
+      'orphan-target',
+      'older-published',
+      'root-target',
+    ];
+    const existingTags = {
+      '2026.08.18': 'older-published',
+      '2026.08.19': 'orphan-target',
+      '2026.08.20': 'newer-published',
+    };
+    const publishedTags = new Set(['2026.08.18', '2026.08.20']);
+    const selection = selectDatedTag(
+      '2026.08.21',
+      'current-target',
+      existingTags,
+      publishedTags,
+      history,
+    );
+
+    expect(selection).toEqual({
+      tag: '2026.08.19',
+      action: 'recover',
+      releaseTargetSha: 'orphan-target',
+    });
+    expect(
+      selectReleaseBoundary(history, selection.releaseTargetSha, existingTags, publishedTags),
+    ).toBe('older-published');
+
+    publishedTags.add(selection.tag);
+    const nextSelection = selectDatedTag(
+      '2026.08.21',
+      'current-target',
+      existingTags,
+      publishedTags,
+      history,
+    );
+
+    expect(nextSelection).toEqual({
+      tag: '2026.08.21',
+      action: 'create',
+      releaseTargetSha: 'current-target',
+    });
+    expect(
+      selectReleaseBoundary(history, nextSelection.releaseTargetSha, existingTags, publishedTags),
+    ).toBe('newer-published');
+  });
+
   test('publishes an orphan range before the remaining current range', () => {
     const existingTags = { '2026.08.21': 'orphan-target' };
-    const first = selectDatedTag('2026.08.22', 'current-target', existingTags, new Set(), [
-      'orphan-target',
-      'current-target',
-    ]);
+    const history = ['current-target', 'orphan-target'];
+    const first = selectDatedTag('2026.08.22', 'current-target', existingTags, new Set(), history);
     const second = selectDatedTag(
       '2026.08.22',
       'current-target',
       existingTags,
       new Set([first.tag]),
-      ['current-target'],
+      history,
     );
 
     expect(first.releaseTargetSha).toBe('orphan-target');
@@ -237,7 +337,7 @@ describe('dated tag selection', () => {
           '2026.08.21': 'earlier-target',
         },
         new Set(),
-        ['earlier-target', 'later-target', 'current-target'],
+        ['current-target', 'later-target', 'earlier-target'],
       ),
     ).toEqual({
       tag: '2026.08.21',
@@ -283,37 +383,22 @@ describe('dated tag selection', () => {
     });
   });
 
-  test('includes the repository root only for the first release', () => {
+  test('recovers an unpublished tag on the repository root', () => {
     const history = ['current-target', 'middle-target', 'root-target'];
 
-    expect(eligibleReleaseCommits(history, 'root-target', true)).toEqual([
-      'root-target',
-      'middle-target',
-      'current-target',
-    ]);
-    expect(eligibleReleaseCommits(history, 'root-target', false)).toEqual([
-      'middle-target',
-      'current-target',
-    ]);
     expect(
       selectDatedTag(
         '2026.08.22',
         'current-target',
         { '2026.08.21': 'root-target' },
         new Set(),
-        eligibleReleaseCommits(history, 'root-target', true),
+        history,
       ),
     ).toEqual({
       tag: '2026.08.21',
       action: 'recover',
       releaseTargetSha: 'root-target',
     });
-  });
-
-  test('fails closed when a release boundary is outside first-parent history', () => {
-    expect(() => eligibleReleaseCommits(['current-target'], 'off-main', false)).toThrow(
-      'is not in the first-parent history',
-    );
   });
 });
 
