@@ -50,22 +50,22 @@ jobs:
         id: build_notes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TARGET_SHA: ${{ steps.build_notes.outputs.release_target_sha }}
+          RELEASE_TARGET_SHA: ${{ steps.target.outputs.target_sha }}
         run: |
           set -euo pipefail
           bun ./scripts/release-notes.ts
           test -s RELEASE_NOTES.md
 
-            - name: Select or recover dated tag
+      - name: Select or recover dated tag
         id: release_tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.build_notes.outputs.tag }}
+          TAG_ACTION: ${{ steps.build_notes.outputs.tag_action }}
           RELEASE_TARGET_SHA: ${{ steps.build_notes.outputs.release_target_sha }}
         run: |
           set -euo pipefail
 
-          TAG="${{ steps.build_notes.outputs.tag }}"
-          TAG_ACTION="${{ steps.build_notes.outputs.tag_action }}"
           REPOSITORY_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           case "$TAG_ACTION" in
@@ -96,7 +96,7 @@ jobs:
 
       - name: Publish or recover GitHub release
         env:
-          GH_TOKEN: ${{ secrets.target.outputs.target_sha}}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           set -euo pipefail
@@ -115,6 +115,7 @@ jobs:
             else
               echo "Release $TAG already exists. Nothing to publish."
             fi
+
             exit 0
           fi
 
