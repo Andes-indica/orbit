@@ -82,6 +82,15 @@ function isDatedReleaseTag(tag: string): boolean {
   return /^\d{4}\.\d{2}\.\d{2}(?:-\d+)?$/.test(tag);
 }
 
+export function datedTagsFromRefOutput(output: string): string[] {
+  const tags: string[] = [];
+  for (const line of output.split('\n')) {
+    const [tag] = line.split(' ');
+    if (tag && isDatedReleaseTag(tag)) tags.push(tag);
+  }
+  return tags;
+}
+
 export function selectLatestPublishedRelease(releases: GitHubRelease[]): GitHubRelease | null {
   const published = releases.filter(
     (release) =>
@@ -143,12 +152,50 @@ async function getReleaseBoundary(
 
 type TagAction = 'create' | 'reuse' | 'recover';
 
+function compareDatedTags(left: string, right: string): number {
+  const leftDate = left.slice(0, 10);
+  const rightDate = right.slice(0, 10);
+  if (leftDate < rightDate) return -1;
+  if (leftDate > rightDate) return 1;
+  const leftSuffix = left.length === 10 ? 0 : Number(left.slice(11));
+  const rightSuffix = right.length === 10 ? 0 : Number(right.slice(11));
+  return leftSuffix - rightSuffix;
+}
+
+export function eligibleReleaseCommits(
+  firstParentHistory: readonly string[],
+  baseSha: string,
+  includeBoundary: boolean,
+): string[] {
+  const boundaryIndex = firstParentHistory.indexOf(baseSha);
+  if (boundaryIndex === -1) {
+    throw new Error(`Release base ${baseSha} is not in the first-parent history`);
+  }
+  const commits = firstParentHistory.slice(0, boundaryIndex).reverse();
+  if (includeBoundary) commits.unshift(baseSha);
+  return commits;
+}
+
 export function selectDatedTag(
   baseTag: string,
   targetSha: string,
   existingTags: Record<string, string>,
   publishedTags: Set<string>,
+  eligibleCommits: readonly string[] = [],
 ): { tag: string; action: TagAction; releaseTargetSha: string } {
+  const commitOrder = new Map(eligibleCommits.map((sha, index) => [sha, index]));
+  const orphan = Object.entries(existingTags)
+    .filter(([tag, sha]) => !publishedTags.has(tag) && commitOrder.has(sha))
+    .sort(([leftTag, leftSha], [rightTag, rightSha]) => {
+      const order = (commitOrder.get(leftSha) ?? 0) - (commitOrder.get(rightSha) ?? 0);
+      return order === 0 ? compareDatedTags(leftTag, rightTag) : order;
+    })[0];
+
+  if (orphan) {
+    const [tag, releaseTargetSha] = orphan;
+    return { tag, action: 'recover', releaseTargetSha };
+  }
+
   let count = 0;
 
   while (true) {
@@ -163,14 +210,10 @@ export function selectDatedTag(
       return { tag, action: 'reuse', releaseTargetSha: existingSha };
     }
 
-    if (!publishedTags.has(tag)) {
-      return { tag, action: 'recover', releaseTargetSha: existingSha };
-    }
-
     count += 1;
   }
 }
-async function getExistingDatedTags(baseTag: string): Promise<Record<string, string>> {
+async function getExistingDatedTags(): Promise<Record<string, string>> {
   const output = await runGit([
     'for-each-ref',
     'refs/tags',
@@ -178,10 +221,7 @@ async function getExistingDatedTags(baseTag: string): Promise<Record<string, str
   ]);
   const tags: Record<string, string> = {};
 
-  for (const line of output.split('\n')) {
-    const [tag] = line.split(' ');
-    if (!tag?.startsWith(baseTag)) continue;
-    if (!isDatedReleaseTag(tag)) continue;
+  for (const tag of datedTagsFromRefOutput(output)) {
     tags[tag] = await runGit(['rev-list', '-n', '1', `${tag}^{commit}`]);
   }
 
@@ -332,9 +372,23 @@ async function main(): Promise<void> {
   const published = await getPublishedReleases();
   const publishedTags = new Set(published.map((release) => release.tag_name));
   const baseTag = new Date().toISOString().slice(0, 10).replaceAll('-', '.');
-  const existingTags = await getExistingDatedTags(baseTag);
-  const selectedTag = selectDatedTag(baseTag, targetSha, existingTags, publishedTags);
-  const baseSha = await getReleaseBoundary(published, selectedTag.releaseTargetSha);
+  const existingTags = await getExistingDatedTags();
+  const baseSha = await getReleaseBoundary(published, targetSha);
+  const history = (await runGit(['rev-list', '--first-parent', targetSha]))
+    .split('\n')
+    .filter((sha) => sha.length > 0);
+  const eligibleCommits = eligibleReleaseCommits(
+    history,
+    baseSha,
+    selectLatestPublishedRelease(published) === null,
+  );
+  const selectedTag = selectDatedTag(
+    baseTag,
+    targetSha,
+    existingTags,
+    publishedTags,
+    eligibleCommits,
+  );
   const prs = await collectPullRequests(baseSha, selectedTag.releaseTargetSha);
   const notes = renderNotes(prs, baseSha, selectedTag.releaseTargetSha);
   await writeFile('RELEASE_NOTES.md', notes, 'utf8');

@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
   collectCommitsInRange,
+  datedTagsFromRefOutput,
+  eligibleReleaseCommits,
   groupByArea,
   isMainReleasePR,
   renderNotes,
@@ -107,6 +109,14 @@ describe('published release boundary selection', () => {
 });
 
 describe('dated tag selection', () => {
+  test('discovers dated tags across UTC dates and ignores unrelated tags', () => {
+    expect(
+      datedTagsFromRefOutput(
+        '2026.08.21 old-target\n2026.08.22-2 current-target\nv1.0.0 unrelated-target',
+      ),
+    ).toEqual(['2026.08.21', '2026.08.22-2']);
+  });
+
   test('reuses an existing tag when it already points at the target', () => {
     expect(
       selectDatedTag(
@@ -151,6 +161,7 @@ describe('dated tag selection', () => {
           '2026.08.21': 'old-target',
         },
         new Set(),
+        ['old-target', 'new-target'],
       ),
     ).toEqual({
       tag: '2026.08.21',
@@ -174,6 +185,135 @@ describe('dated tag selection', () => {
       action: 'create',
       releaseTargetSha: 'new-target',
     });
+  });
+
+  test('recovers a prior-date orphan before creating a tag for today', () => {
+    expect(
+      selectDatedTag(
+        '2026.08.22',
+        'current-target',
+        {
+          '2026.08.21': 'orphan-target',
+        },
+        new Set(),
+        ['orphan-target', 'current-target'],
+      ),
+    ).toEqual({
+      tag: '2026.08.21',
+      action: 'recover',
+      releaseTargetSha: 'orphan-target',
+    });
+  });
+
+  test('publishes an orphan range before the remaining current range', () => {
+    const existingTags = { '2026.08.21': 'orphan-target' };
+    const first = selectDatedTag('2026.08.22', 'current-target', existingTags, new Set(), [
+      'orphan-target',
+      'current-target',
+    ]);
+    const second = selectDatedTag(
+      '2026.08.22',
+      'current-target',
+      existingTags,
+      new Set([first.tag]),
+      ['current-target'],
+    );
+
+    expect(first.releaseTargetSha).toBe('orphan-target');
+    expect(second).toEqual({
+      tag: '2026.08.22',
+      action: 'create',
+      releaseTargetSha: 'current-target',
+    });
+  });
+
+  test('recovers multiple orphans in first-parent order', () => {
+    expect(
+      selectDatedTag(
+        '2026.08.23',
+        'current-target',
+        {
+          '2026.08.20': 'later-target',
+          '2026.08.21': 'earlier-target',
+        },
+        new Set(),
+        ['earlier-target', 'later-target', 'current-target'],
+      ),
+    ).toEqual({
+      tag: '2026.08.21',
+      action: 'recover',
+      releaseTargetSha: 'earlier-target',
+    });
+  });
+
+  test('ignores orphans outside the eligible release path', () => {
+    expect(
+      selectDatedTag(
+        '2026.08.22',
+        'current-target',
+        {
+          '2026.08.19': 'before-boundary',
+          '2026.08.20': 'off-main',
+        },
+        new Set(),
+        ['current-target'],
+      ),
+    ).toEqual({
+      tag: '2026.08.22',
+      action: 'create',
+      releaseTargetSha: 'current-target',
+    });
+  });
+
+  test('preserves an off-main tag for today and creates a suffix', () => {
+    expect(
+      selectDatedTag(
+        '2026.08.22',
+        'current-target',
+        {
+          '2026.08.22': 'off-main',
+        },
+        new Set(),
+        ['current-target'],
+      ),
+    ).toEqual({
+      tag: '2026.08.22-1',
+      action: 'create',
+      releaseTargetSha: 'current-target',
+    });
+  });
+
+  test('includes the repository root only for the first release', () => {
+    const history = ['current-target', 'middle-target', 'root-target'];
+
+    expect(eligibleReleaseCommits(history, 'root-target', true)).toEqual([
+      'root-target',
+      'middle-target',
+      'current-target',
+    ]);
+    expect(eligibleReleaseCommits(history, 'root-target', false)).toEqual([
+      'middle-target',
+      'current-target',
+    ]);
+    expect(
+      selectDatedTag(
+        '2026.08.22',
+        'current-target',
+        { '2026.08.21': 'root-target' },
+        new Set(),
+        eligibleReleaseCommits(history, 'root-target', true),
+      ),
+    ).toEqual({
+      tag: '2026.08.21',
+      action: 'recover',
+      releaseTargetSha: 'root-target',
+    });
+  });
+
+  test('fails closed when a release boundary is outside first-parent history', () => {
+    expect(() => eligibleReleaseCommits(['current-target'], 'off-main', false)).toThrow(
+      'is not in the first-parent history',
+    );
   });
 });
 
