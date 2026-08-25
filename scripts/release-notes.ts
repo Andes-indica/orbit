@@ -131,10 +131,15 @@ export function selectReleaseBoundary(
   }
 
   let boundaryIndex = firstParentHistory.length;
+  let coveredByNewerRelease = false;
 
   for (const [tag, sha] of Object.entries(existingTags)) {
     if (!publishedTags.has(tag)) continue;
     const candidateIndex = commitOrder.get(sha);
+    if (candidateIndex !== undefined && candidateIndex < targetIndex) {
+      coveredByNewerRelease = true;
+      continue;
+    }
     if (
       candidateIndex !== undefined &&
       candidateIndex >= targetIndex &&
@@ -143,6 +148,8 @@ export function selectReleaseBoundary(
       boundaryIndex = candidateIndex;
     }
   }
+
+  if (coveredByNewerRelease) return releaseTargetSha;
 
   const boundary = firstParentHistory[boundaryIndex] ?? firstParentHistory.at(-1);
 

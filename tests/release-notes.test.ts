@@ -116,7 +116,7 @@ describe('published release boundary selection', () => {
     ).toBe(false);
   });
 
-  test('uses the nearest published commit at or before the selected target', () => {
+  test('uses the target when a newer published release already covers it', () => {
     expect(
       selectReleaseBoundary(
         history,
@@ -124,6 +124,12 @@ describe('published release boundary selection', () => {
         existingTags,
         new Set(['2026.08.18', '2026.08.20']),
       ),
+    ).toBe('orphan-target');
+  });
+
+  test('uses the nearest older published commit when no newer release covers the target', () => {
+    expect(
+      selectReleaseBoundary(history, 'orphan-target', existingTags, new Set(['2026.08.18'])),
     ).toBe('older-published');
   });
 
@@ -286,7 +292,7 @@ describe('dated tag selection', () => {
     });
     expect(
       selectReleaseBoundary(history, selection.releaseTargetSha, existingTags, publishedTags),
-    ).toBe('older-published');
+    ).toBe('orphan-target');
 
     publishedTags.add(selection.tag);
     const nextSelection = selectDatedTag(
@@ -304,6 +310,64 @@ describe('dated tag selection', () => {
     });
     expect(
       selectReleaseBoundary(history, nextSelection.releaseTargetSha, existingTags, publishedTags),
+    ).toBe('newer-published');
+  });
+
+  test('recovers multiple covered historical orphans without overlapping ranges', () => {
+    const history = [
+      'current-target',
+      'newer-published',
+      'later-orphan',
+      'earlier-orphan',
+      'older-published',
+      'root-target',
+    ];
+    const existingTags = {
+      '2026.08.18': 'older-published',
+      '2026.08.19': 'earlier-orphan',
+      '2026.08.20': 'later-orphan',
+      '2026.08.21': 'newer-published',
+    };
+    const publishedTags = new Set(['2026.08.18', '2026.08.21']);
+    const first = selectDatedTag(
+      '2026.08.22',
+      'current-target',
+      existingTags,
+      publishedTags,
+      history,
+    );
+
+    expect(first.releaseTargetSha).toBe('earlier-orphan');
+    expect(
+      selectReleaseBoundary(history, first.releaseTargetSha, existingTags, publishedTags),
+    ).toBe('earlier-orphan');
+
+    publishedTags.add(first.tag);
+    const second = selectDatedTag(
+      '2026.08.22',
+      'current-target',
+      existingTags,
+      publishedTags,
+      history,
+    );
+
+    expect(second.releaseTargetSha).toBe('later-orphan');
+    expect(
+      selectReleaseBoundary(history, second.releaseTargetSha, existingTags, publishedTags),
+    ).toBe('later-orphan');
+
+    publishedTags.add(second.tag);
+    const current = selectDatedTag(
+      '2026.08.22',
+      'current-target',
+      existingTags,
+      publishedTags,
+      history,
+    );
+
+    expect(current.releaseTargetSha).toBe('current-target');
+    expect(
+      selectReleaseBoundary(history, current.releaseTargetSha, existingTags, publishedTags),
     ).toBe('newer-published');
   });
 
