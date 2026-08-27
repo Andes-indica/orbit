@@ -1,8 +1,8 @@
 :root {
   --vp-font-family-base:
-    -apple-system, "SF Pro Text", "Segoe UI", system-ui, "Helvetica Neue", Arial, sans-serif;
+    -apple-system, "SF Pro Text", "Segoe UI", system-ui, "Helvetica Neue", arial, sans-serif;
   --vp-font-family-mono:
-    "SF Mono", ui-monospace, "JetBrains Mono", "Roboto Mono", Menlo, Consolas, monospace;
+    "SF Mono", ui-monospace, "JetBrains Mono", "Roboto Mono", menlo, consolas, monospace;
   --vp-c-brand-1: #4d57bd;
   --vp-c-brand-2: #3f49a8;
   --vp-c-brand-3: #343d98;
